@@ -12,8 +12,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 RUN python manage.py collectstatic --noinput
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "python manage.py migrate --noinput && gunicorn drone.wsgi:application --bind 0.0.0.0:${PORT:-8000} --access-logfile -"]
+CMD ["/app/entrypoint.sh"]
 
