@@ -1,6 +1,7 @@
 server {
     listen ${PORT};
     server_name _;
+    client_max_body_size 25m;
 
     root /usr/share/nginx/html;
     index index.html;
@@ -25,4 +26,3 @@ server {
         proxy_pass ${BACKEND_URL};
     }
 }
-
