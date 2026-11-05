@@ -3,17 +3,22 @@
 本模块只负责参数校验、模型持久化和 JSON 序列化，不包含模型训练、推理或调度算法。
 """
 
+import importlib.util
 import json
 import uuid
 from functools import wraps
 from pathlib import Path
 
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
-from django.db import IntegrityError
+from django.db import IntegrityError, connection
+from django.db.models import Count
+from django.db.utils import DatabaseError
 from django.http import JsonResponse
 from django.middleware.csrf import get_token
+from django.utils import timezone
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_http_methods
 
@@ -146,6 +151,56 @@ def _page(request, queryset, serializer):
 def _iso(value):
     """把可空时间序列化为 ISO 8601 字符串。"""
     return value.isoformat() if value else None
+
+
+MAX_IMAGE_SIZE = 20 * 1024 * 1024
+ALLOWED_IMAGE_SUFFIXES = {'.jpg', '.jpeg', '.png', '.webp'}
+
+
+def _validate_uploaded_image(uploaded):
+    """校验上传图片的类型、扩展名和大小。"""
+    if uploaded is None:
+        raise APIInputError('请使用 multipart/form-data 上传 image 文件。', 'missing_image')
+    if not (uploaded.content_type or '').startswith('image/'):
+        raise APIInputError('只支持 JPG、PNG、WEBP 等图像文件。', 'invalid_image_type')
+    if uploaded.size > MAX_IMAGE_SIZE:
+        raise APIInputError('图像不能超过 20 MB。', 'image_too_large')
+    suffix = Path(uploaded.name or '').suffix.lower()
+    if suffix not in ALLOWED_IMAGE_SUFFIXES:
+        raise APIInputError('图像扩展名只支持 .jpg、.jpeg、.png、.webp。', 'invalid_image_suffix')
+    return suffix
+
+
+def _image_response(path):
+    """返回文件的相对路径和存储 URL。"""
+    return {
+        'path': path,
+        'url': default_storage.url(path),
+    }
+
+
+def _model_health():
+    """检查视觉依赖和权重是否具备，不在健康检查中加载模型。"""
+    dependencies_ready = all(
+        importlib.util.find_spec(module_name) is not None
+        for module_name in ('torch', 'torchvision', 'PIL')
+    )
+    artifact = ModelArtifact.objects.filter(
+        algorithm_type=ModelArtifact.AlgorithmType.DEEP_SEGMENTATION,
+    ).order_by('-created_at').first()
+    weight_exists = False
+    if artifact:
+        weight_path = Path(artifact.weight_path)
+        if not weight_path.is_absolute():
+            weight_path = Path(settings.MODEL_DIR) / weight_path
+        weight_exists = weight_path.exists()
+    return {
+        'status': 'ready' if dependencies_ready and weight_exists else 'unavailable',
+        'dependencies_ready': dependencies_ready,
+        'weight_registered': artifact is not None,
+        'weight_ready': weight_exists,
+        'model_artifact_id': artifact.pk if artifact else None,
+    }
 
 
 def _dataset_data(item):
@@ -284,8 +339,60 @@ def csrf_token(request):
 
 @require_GET
 def health(request):
-    """返回 API 和数据库服务状态。"""
-    return _ok({'service': 'core-api', 'status': 'ok', 'database': 'ok'})
+    """检查 API、数据库连接和视觉模型准备状态。"""
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT 1')
+            cursor.fetchone()
+    except DatabaseError:
+        return _fail(
+            '数据库连接不可用。',
+            'database_unavailable',
+            503,
+            {'service': 'core-api', 'database': 'error'},
+        )
+    return _ok({
+        'service': 'core-api',
+        'status': 'ok',
+        'database': 'ok',
+        'model': _model_health(),
+        'api_version': 'v1',
+    })
+
+
+@api_errors
+@require_http_methods(['POST'])
+def upload_image(request):
+    """保存一张航拍图像，并创建或更新一个待识别 Mission。"""
+    uploaded = request.FILES.get('image')
+    suffix = _validate_uploaded_image(uploaded)
+    mission = None
+    if request.POST.get('mission_id'):
+        mission = _related(Mission, request.POST['mission_id'], 'mission_id')
+
+    token = uuid.uuid4().hex
+    image_rel = default_storage.save(f'missions/{token}{suffix}', uploaded)
+    if mission is None:
+        mission = Mission(
+            name=(request.POST.get('name') or Path(uploaded.name).stem)[:150],
+            input_image_path=image_rel,
+            status=Mission.Status.CREATED,
+        )
+    else:
+        mission.input_image_path = image_rel
+        if request.POST.get('name'):
+            mission.name = request.POST['name'][:150]
+    mission.full_clean()
+    mission.save()
+    image = _image_response(image_rel)
+    return _ok({
+        'mission_id': mission.pk,
+        'mission': _mission_data(mission),
+        'image': image,
+        'filename': uploaded.name,
+        'content_type': uploaded.content_type,
+        'size': uploaded.size,
+    }, status=201)
 
 
 @api_errors
@@ -293,12 +400,7 @@ def health(request):
 def vision_infer(request):
     """上传一张航拍图并调用已训练的 FloodNet 分割模型。"""
     uploaded = request.FILES.get('image')
-    if uploaded is None:
-        raise APIInputError('请使用 multipart/form-data 上传 image 文件。', 'missing_image')
-    if not (uploaded.content_type or '').startswith('image/'):
-        raise APIInputError('只支持 JPG、PNG 等图像文件。', 'invalid_image_type')
-    if uploaded.size > 20 * 1024 * 1024:
-        raise APIInputError('图像不能超过 20 MB。', 'image_too_large')
+    suffix = _validate_uploaded_image(uploaded)
 
     artifact = None
     if request.POST.get('model_artifact_id'):
@@ -317,19 +419,17 @@ def vision_infer(request):
     except (OSError, ValueError) as exc:
         return _fail(f'图像处理失败：{exc}', 'inference_failed', 422)
 
-    suffix = Path(uploaded.name).suffix.lower() or '.jpg'
     token = uuid.uuid4().hex
     uploaded.seek(0)
     image_rel = default_storage.save(f'missions/{token}{suffix}', ContentFile(uploaded.read()))
     mask_rel = default_storage.save(f'missions/{token}_mask.png', ContentFile(result.pop('mask_bytes')))
     mission_name = request.POST.get('name') or Path(uploaded.name).stem
-    mission = Mission(
-        name=mission_name[:150],
-        input_image_path=image_rel,
-        mask_path=mask_rel,
-        status=Mission.Status.READY,
-        model_artifact=artifact,
-    )
+    mission = _related(Mission, request.POST['mission_id'], 'mission_id') if request.POST.get('mission_id') else Mission()
+    mission.name = mission_name[:150]
+    mission.input_image_path = image_rel
+    mission.mask_path = mask_rel
+    mission.status = Mission.Status.READY
+    mission.model_artifact = artifact
     mission.full_clean()
     mission.save()
 
@@ -350,6 +450,10 @@ def datasets(request):
     """查询或新增数据集记录。"""
     if request.method == 'GET':
         queryset = Dataset.objects.all()
+        if request.GET.get('q'):
+            queryset = queryset.filter(name__icontains=request.GET['q'])
+        if request.GET.get('version'):
+            queryset = queryset.filter(version=request.GET['version'])
         return _ok(_page(request, queryset, _dataset_data))
     payload = _payload(request)
     name, source_url, license_name, version, local_index_path = _required(
@@ -399,6 +503,12 @@ def missions(request):
     """查询或新增灾情复查任务记录。"""
     if request.method == 'GET':
         queryset = Mission.objects.select_related('model_artifact').all()
+        if request.GET.get('status'):
+            queryset = queryset.filter(status=request.GET['status'])
+        if request.GET.get('model_artifact_id'):
+            queryset = queryset.filter(model_artifact_id=request.GET['model_artifact_id'])
+        if request.GET.get('q'):
+            queryset = queryset.filter(name__icontains=request.GET['q'])
         return _ok(_page(request, queryset, _mission_data))
     payload = _payload(request)
     name, input_image_path = _required(payload, 'name', 'input_image_path')
@@ -418,6 +528,36 @@ def missions(request):
 
 
 @api_errors
+@require_http_methods(['GET', 'PATCH', 'DELETE'])
+def mission_detail(request, mission_id):
+    """查询、部分更新或删除一条复查任务。"""
+    mission = _related(Mission, mission_id, 'mission_id')
+    if request.method == 'GET':
+        return _ok(_mission_data(mission))
+    if request.method == 'DELETE':
+        mission.delete()
+        return _ok({'id': mission_id, 'deleted': True})
+
+    payload = _payload(request)
+    if 'name' in payload:
+        mission.name = payload['name']
+    if 'input_image_path' in payload:
+        mission.input_image_path = payload['input_image_path']
+    if 'mask_path' in payload:
+        mission.mask_path = payload['mask_path']
+    if 'status' in payload:
+        mission.status = payload['status']
+    if 'model_artifact_id' in payload:
+        mission.model_artifact = (
+            _related(ModelArtifact, payload['model_artifact_id'], 'model_artifact_id')
+            if payload['model_artifact_id'] is not None else None
+        )
+    mission.full_clean()
+    mission.save()
+    return _ok(_mission_data(mission))
+
+
+@api_errors
 @require_http_methods(['GET', 'POST'])
 def task_points(request):
     """查询或新增复查任务点记录。"""
@@ -425,6 +565,12 @@ def task_points(request):
         queryset = TaskPoint.objects.select_related('mission', 'assigned_uav').all()
         if request.GET.get('mission_id'):
             queryset = queryset.filter(mission_id=request.GET['mission_id'])
+        if request.GET.get('status'):
+            queryset = queryset.filter(status=request.GET['status'])
+        if request.GET.get('disaster_category'):
+            queryset = queryset.filter(disaster_category=request.GET['disaster_category'])
+        if request.GET.get('assigned_uav_id'):
+            queryset = queryset.filter(assigned_uav_id=request.GET['assigned_uav_id'])
         return _ok(_page(request, queryset, _task_point_data))
     payload = _payload(request)
     mission_id, category = _required(payload, 'mission_id', 'disaster_category')
@@ -446,6 +592,57 @@ def task_points(request):
     item.full_clean()
     item.save()
     return _ok(_task_point_data(item), status=201)
+
+
+@api_errors
+@require_http_methods(['GET', 'PATCH', 'DELETE'])
+def task_point_detail(request, task_point_id):
+    """查询、部分更新或删除一条复查任务点。"""
+    item = _related(TaskPoint, task_point_id, 'task_point_id')
+    if request.method == 'GET':
+        return _ok(_task_point_data(item))
+    if request.method == 'DELETE':
+        item.delete()
+        return _ok({'id': task_point_id, 'deleted': True})
+
+    payload = _payload(request)
+    if 'coordinate_x' in payload:
+        item.coordinate_x = _float_value(payload, 'coordinate_x', minimum=0)
+    if 'coordinate_y' in payload:
+        item.coordinate_y = _float_value(payload, 'coordinate_y', minimum=0)
+    if 'disaster_category' in payload:
+        item.disaster_category = payload['disaster_category']
+    if 'area' in payload:
+        item.area = _float_value(payload, 'area', minimum=0)
+    if 'confidence' in payload:
+        item.confidence = _float_value(payload, 'confidence', minimum=0, maximum=1)
+    if 'priority' in payload:
+        item.priority = _int_value(payload, 'priority', minimum=0)
+    if 'status' in payload:
+        item.status = payload['status']
+    if 'assigned_uav_id' in payload:
+        item.assigned_uav = (
+            _related(UAV, payload['assigned_uav_id'], 'assigned_uav_id')
+            if payload['assigned_uav_id'] is not None else None
+        )
+    item.full_clean()
+    item.save()
+    return _ok(_task_point_data(item))
+
+
+@require_GET
+def disaster_categories(request):
+    """返回灾情类别目录及当前任务点数量。"""
+    counts = dict(
+        TaskPoint.objects.values('disaster_category')
+        .annotate(count=Count('id'))
+        .values_list('disaster_category', 'count')
+    )
+    items = [
+        {'value': value, 'label': label, 'count': counts.get(value, 0)}
+        for value, label in TaskPoint.DisasterCategory.choices
+    ]
+    return _ok({'items': items, 'count': len(items)})
 
 
 @api_errors
@@ -472,14 +669,43 @@ def uavs(request):
 
 
 @api_errors
-@require_http_methods(['GET', 'POST'])
+@require_http_methods(['GET', 'POST', 'PATCH'])
 def simulation_runs(request):
-    """查询或新增调度仿真运行记录。"""
+    """查询、新增或更新调度仿真运行记录。"""
     if request.method == 'GET':
         queryset = SimulationRun.objects.select_related('mission').all()
         if request.GET.get('mission_id'):
             queryset = queryset.filter(mission_id=request.GET['mission_id'])
         return _ok(_page(request, queryset, _simulation_run_data))
+    if request.method == 'PATCH':
+        simulation_id = request.GET.get('simulation_id')
+        if not simulation_id:
+            raise APIInputError('PATCH 请求必须提供 simulation_id。', 'missing_field')
+        item = _related(SimulationRun, simulation_id, 'simulation_id')
+        payload = _payload(request)
+        if 'planning_method' in payload:
+            item.planning_method = payload['planning_method']
+        if 'random_seed' in payload:
+            item.random_seed = _int_value(payload, 'random_seed', item.random_seed, minimum=0)
+        if 'uav_configuration' in payload:
+            item.uav_configuration = payload['uav_configuration']
+        if 'task_snapshot' in payload:
+            item.task_snapshot = payload['task_snapshot']
+        if 'summary_metrics' in payload:
+            item.summary_metrics = payload['summary_metrics']
+        if 'status' in payload:
+            item.status = payload['status']
+            if item.status == SimulationRun.Status.RUNNING and item.started_at is None:
+                item.started_at = timezone.now()
+            if item.status in {
+                SimulationRun.Status.COMPLETED,
+                SimulationRun.Status.FAILED,
+                SimulationRun.Status.CANCELLED,
+            }:
+                item.finished_at = timezone.now()
+        item.full_clean()
+        item.save()
+        return _ok(_simulation_run_data(item))
     payload = _payload(request)
     mission_id, planning_method = _required(payload, 'mission_id', 'planning_method')
     item = SimulationRun(
@@ -491,6 +717,14 @@ def simulation_runs(request):
         summary_metrics=payload.get('summary_metrics', {}),
         status=payload.get('status', SimulationRun.Status.CREATED),
     )
+    if item.status == SimulationRun.Status.RUNNING:
+        item.started_at = timezone.now()
+    elif item.status in {
+        SimulationRun.Status.COMPLETED,
+        SimulationRun.Status.FAILED,
+        SimulationRun.Status.CANCELLED,
+    }:
+        item.finished_at = timezone.now()
     item.full_clean()
     item.save()
     return _ok(_simulation_run_data(item), status=201)
