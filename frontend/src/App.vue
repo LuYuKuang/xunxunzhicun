@@ -1,7 +1,18 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
-import { fetchCollection, recognizeImage } from './api/client'
+import {
+  fetchCollection,
+  fetchDisasterCategories,
+  fetchHealth,
+  fetchResource,
+  createSimulationEvent,
+  createSimulationRun,
+  recognizeImage,
+  updateSimulationRun,
+  updateMission,
+  uploadImage,
+} from './api/client'
 
 const activeView = ref('overview')
 const selectedAlgorithm = ref('风险加权 PSO')
@@ -19,6 +30,8 @@ const isRunning = ref(false)
 const simulationProgress = ref(72)
 const simulationStatus = ref('已完成首轮规划')
 const simulationTimer = ref(null)
+const simulationRunId = ref(null)
+const simulationError = ref('')
 const failedUav = ref('')
 const dataMenuOpen = ref(true)
 const activeDataGroup = ref('data-assets')
@@ -26,6 +39,27 @@ const tableRows = ref([])
 const tableCount = ref(0)
 const tableLoading = ref(false)
 const tableError = ref('')
+const missionRows = ref([])
+const missionCount = ref(0)
+const missionLoading = ref(false)
+const missionError = ref('')
+const missionStatusFilter = ref('')
+const selectedMissionId = ref(null)
+const missionDetail = ref(null)
+const missionDetailLoading = ref(false)
+const missionDetailError = ref('')
+const missionTaskPoints = ref([])
+const missionSimulationRuns = ref([])
+const taskPointRows = ref([])
+const taskPointCount = ref(0)
+const taskPointLoading = ref(false)
+const taskPointError = ref('')
+const taskPointCategoryFilter = ref('')
+const taskPointStatusFilter = ref('')
+const disasterCategoryOptions = ref([])
+const healthStatus = ref(null)
+const healthLoading = ref(false)
+const uploadStage = ref('')
 
 const navItems = [
   { id: 'overview', label: '总览', index: '01' },
@@ -183,6 +217,7 @@ const dataTableConfigs = {
 const viewMeta = {
   overview: { eyebrow: 'CONTROL CENTER', title: '项目总览', description: '从灾情识别到多机复查，掌握每一步运行状态。' },
   recognition: { eyebrow: 'VISION MODULE', title: '灾情识别', description: '上传航拍图像，提取灾情区域并生成复查任务。' },
+  mission_detail: { eyebrow: 'MISSION CENTER / DETAIL', title: '任务详情', description: '查看任务状态、关联图像、任务点和仿真记录。' },
   simulation: { eyebrow: 'SWARM SIMULATION', title: '调度仿真', description: '在二维地图中观察任务分配、航线执行与动态重规划。' },
   experiments: { eyebrow: 'BENCHMARK LAB', title: '实验对比', description: '用统一任务和随机种子比较不同调度策略。' },
 }
@@ -246,7 +281,9 @@ function routePath(route) {
 
 function openView(view) {
   activeView.value = view
-  if (dataTableConfigs[view]) loadDataView(view)
+  if (dataTableConfigs[view] && !['missions', 'task_points'].includes(view)) loadDataView(view)
+  if (view === 'missions') loadMissionList()
+  if (view === 'task_points') loadTaskPointList()
 }
 
 function openDataGroup(group) {
@@ -272,6 +309,106 @@ async function loadDataView(view = activeView.value) {
   }
 }
 
+async function loadMissionList() {
+  missionLoading.value = true
+  missionError.value = ''
+  try {
+    const params = missionStatusFilter.value ? { status: missionStatusFilter.value } : {}
+    const result = await fetchCollection('/missions/', params)
+    missionRows.value = result.items || []
+    missionCount.value = result.count || 0
+  } catch (error) {
+    missionRows.value = []
+    missionCount.value = 0
+    missionError.value = error.message || '暂时无法读取任务数据。'
+  } finally {
+    missionLoading.value = false
+  }
+}
+
+async function loadTaskPointList() {
+  taskPointLoading.value = true
+  taskPointError.value = ''
+  try {
+    const params = {}
+    if (taskPointCategoryFilter.value) params.disaster_category = taskPointCategoryFilter.value
+    if (taskPointStatusFilter.value) params.status = taskPointStatusFilter.value
+    const result = await fetchCollection('/task-points/', params)
+    taskPointRows.value = result.items || []
+    taskPointCount.value = result.count || 0
+  } catch (error) {
+    taskPointRows.value = []
+    taskPointCount.value = 0
+    taskPointError.value = error.message || '暂时无法读取任务点数据。'
+  } finally {
+    taskPointLoading.value = false
+  }
+}
+
+async function loadMissionDetail(missionId, navigate = true) {
+  if (!missionId) return
+  selectedMissionId.value = missionId
+  if (navigate) activeView.value = 'mission_detail'
+  missionDetailLoading.value = true
+  missionDetailError.value = ''
+  try {
+    const [mission, taskPoints, runs] = await Promise.all([
+      fetchResource(`/missions/${missionId}/`),
+      fetchCollection('/task-points/', { mission_id: missionId }),
+      fetchCollection('/simulation-runs/', { mission_id: missionId }),
+    ])
+    missionDetail.value = mission
+    missionTaskPoints.value = taskPoints.items || []
+    missionSimulationRuns.value = runs.items || []
+  } catch (error) {
+    missionDetail.value = null
+    missionTaskPoints.value = []
+    missionSimulationRuns.value = []
+    missionDetailError.value = error.message || '任务详情读取失败。'
+  } finally {
+    missionDetailLoading.value = false
+  }
+}
+
+function openMissionDetail(missionId) {
+  loadMissionDetail(missionId)
+}
+
+function backToMissionList() {
+  openView('missions')
+}
+
+async function changeMissionStatus(status) {
+  if (!missionDetail.value) return
+  missionDetailError.value = ''
+  try {
+    missionDetail.value = await updateMission(missionDetail.value.id, { status })
+    await loadMissionList()
+  } catch (error) {
+    missionDetailError.value = error.message || '任务状态更新失败。'
+  }
+}
+
+async function loadHealth() {
+  healthLoading.value = true
+  try {
+    healthStatus.value = await fetchHealth()
+  } catch (error) {
+    healthStatus.value = { status: 'error', error: error.message || '服务不可用' }
+  } finally {
+    healthLoading.value = false
+  }
+}
+
+async function loadDisasterCategories() {
+  try {
+    const result = await fetchDisasterCategories()
+    disasterCategoryOptions.value = result.items || []
+  } catch {
+    disasterCategoryOptions.value = []
+  }
+}
+
 function formatCell(value, column) {
   if (value === null || value === undefined || value === '') return '—'
   if (column.type === 'percent') return `${(Number(value) * (Number(value) <= 1 ? 100 : 1)).toFixed(1)}%`
@@ -286,7 +423,15 @@ function openFilePicker() {
 }
 
 function setFile(file) {
-  if (!file || !file.type.startsWith('image/')) return
+  if (!file) return
+  if (!file.type.startsWith('image/')) {
+    recognitionError.value = '请选择 JPG、PNG 或 WEBP 图片。'
+    return
+  }
+  if (file.size > 20 * 1024 * 1024) {
+    recognitionError.value = '图片不能超过 20 MB。'
+    return
+  }
   selectedFile.value = file
   uploadedName.value = file.name
   recognitionReady.value = false
@@ -317,9 +462,12 @@ async function runRecognition() {
     return
   }
   isProcessing.value = true
+  uploadStage.value = '正在上传图片…'
   recognitionError.value = ''
   try {
-    const result = await recognizeImage(selectedFile.value)
+    const uploaded = await uploadImage(selectedFile.value)
+    uploadStage.value = '图片已保存，正在请求模型识别…'
+    const result = await recognizeImage(selectedFile.value, '', uploaded.mission_id)
     recognitionResult.value = result
     const colors = ['#6c768d', '#ef8d73', '#9aa0a8', '#e4bc70', '#9aa0a8', '#78d5c5', '#70a674', '#9b9cf8', '#5ba6de', '#9ab267']
     recognitionClasses.value = (result.class_stats || []).map((item) => ({
@@ -329,12 +477,15 @@ async function runRecognition() {
       color: colors[item.id] || '#6c768d',
     })).filter((item) => item.value > 0)
     recognitionReady.value = true
+    await loadMissionList()
+    await loadMissionDetail(result.mission_id, false)
     eventLog.value.unshift({ time: '刚刚', title: '模型识别完成', detail: `Mission #${result.mission_id} · ${result.inference_ms} ms`, tone: 'success' })
   } catch (error) {
     recognitionError.value = error.message || '模型识别失败。'
     recognitionReady.value = false
   } finally {
     isProcessing.value = false
+    uploadStage.value = ''
   }
 }
 
@@ -342,25 +493,105 @@ function toggleTask(task) {
   selectedTask.value = selectedTask.value?.id === task.id ? null : task
 }
 
-function startSimulation() {
-  if (isRunning.value) return
-  isRunning.value = true
-  simulationStatus.value = '仿真运行中'
-  simulationProgress.value = Math.max(8, simulationProgress.value > 95 ? 8 : simulationProgress.value)
-  clearInterval(simulationTimer.value)
-  simulationTimer.value = window.setInterval(() => {
-    simulationProgress.value += 8
-    if (simulationProgress.value >= 100) {
-      simulationProgress.value = 100
-      isRunning.value = false
-      simulationStatus.value = '仿真已完成'
-      clearInterval(simulationTimer.value)
-      eventLog.value.unshift({ time: '刚刚', title: '仿真运行完成', detail: `${selectedAlgorithm.value} · 6 个任务点`, tone: 'success' })
-    }
-  }, 220)
+const planningMethodValues = {
+  最近邻: 'nearest',
+  '标准 PSO': 'pso',
+  '风险加权 PSO': 'risk_aware_pso',
 }
 
-function triggerEvent(type) {
+function simulationTaskSnapshot() {
+  return tasks.value.map((task) => ({
+    id: task.id,
+    label: task.label,
+    disaster_category: task.type,
+    priority: task.level,
+    confidence: task.score,
+    coordinate_x: task.x,
+    coordinate_y: task.y,
+    status: task.status,
+  }))
+}
+
+function simulationUavSnapshot() {
+  return uavs.value.map((uav) => ({
+    identifier: uav.id,
+    name: uav.name,
+    battery_level: uav.battery,
+    status: uav.status,
+    position_x: uav.x,
+    position_y: uav.y,
+    assigned: uav.assigned,
+    route: uav.route,
+  }))
+}
+
+async function finishSimulation() {
+  const runId = simulationRunId.value
+  isRunning.value = false
+  simulationProgress.value = 100
+  simulationStatus.value = '仿真已完成'
+  clearInterval(simulationTimer.value)
+  eventLog.value.unshift({ time: '刚刚', title: '仿真运行完成', detail: `${selectedAlgorithm.value} · ${tasks.value.length} 个任务点`, tone: 'success' })
+  if (!runId) return
+  try {
+    const run = await updateSimulationRun(runId, {
+      status: 'completed',
+      summary_metrics: {
+        completion_rate: tasks.value.length ? completedCount.value / tasks.value.length : 0,
+        planned_distance_km: 3.18,
+        task_count: tasks.value.length,
+        uav_count: uavs.value.length,
+      },
+    })
+    if (missionDetail.value?.id === run.mission_id) {
+      missionSimulationRuns.value = [run, ...missionSimulationRuns.value.filter((item) => item.id !== run.id)]
+    }
+  } catch (error) {
+    simulationError.value = error.message || '仿真已完成，但结果回写失败。'
+  }
+}
+
+async function startSimulation() {
+  if (isRunning.value) return
+  const missionId = missionDetail.value?.id || selectedMissionId.value
+  if (!missionId) {
+    simulationError.value = '请先完成一次图像识别，再进入调度仿真。'
+    simulationStatus.value = '缺少可调度任务'
+    return
+  }
+  simulationError.value = ''
+  isRunning.value = true
+  simulationStatus.value = '仿真运行中'
+  simulationProgress.value = 8
+  clearInterval(simulationTimer.value)
+  try {
+    const run = await createSimulationRun({
+      mission_id: missionId,
+      planning_method: planningMethodValues[selectedAlgorithm.value] || 'risk_aware_pso',
+      random_seed: 42,
+      status: 'running',
+      uav_configuration: simulationUavSnapshot(),
+      task_snapshot: simulationTaskSnapshot(),
+      summary_metrics: {},
+    })
+    simulationRunId.value = run.id
+    simulationStatus.value = `仿真运行中 · #${run.id}`
+    eventLog.value.unshift({ time: '刚刚', title: '仿真运行已创建', detail: `${selectedAlgorithm.value} · Mission #${missionId}`, tone: 'teal' })
+    simulationTimer.value = window.setInterval(() => {
+      simulationProgress.value += 8
+      if (simulationProgress.value >= 100) finishSimulation()
+    }, 420)
+  } catch (error) {
+    isRunning.value = false
+    simulationRunId.value = null
+    simulationStatus.value = '仿真启动失败'
+    simulationError.value = error.message || '无法创建仿真运行记录。'
+  }
+}
+
+async function triggerEvent(type) {
+  simulationError.value = ''
+  const runId = simulationRunId.value
   if (type === '故障') {
     failedUav.value = 'UAV-02'
     const target = uavs.value.find((uav) => uav.id === 'UAV-02')
@@ -371,15 +602,42 @@ function triggerEvent(type) {
     simulationStatus.value = '已触发动态重规划'
     simulationProgress.value = Math.max(simulationProgress.value, 48)
     eventLog.value.unshift({ time: '刚刚', title: 'UAV-02 故障退出', detail: '剩余任务已重新分配给 UAV-01 / UAV-03', tone: 'danger' })
+    if (runId) {
+      try {
+        await createSimulationEvent(runId, {
+          event_type: 'uav_failure',
+          state_before: { uavs: simulationUavSnapshot() },
+          state_after: { failed_uav: 'UAV-02', uavs: simulationUavSnapshot() },
+        })
+      } catch (error) {
+        simulationError.value = error.message || '故障事件回写失败。'
+      }
+    }
   } else {
     simulationStatus.value = '新增任务等待分配'
     eventLog.value.unshift({ time: '刚刚', title: '新增 2 个复查任务', detail: '调度器正在计算最短增量航线', tone: 'orange' })
+    if (runId) {
+      try {
+        await createSimulationEvent(runId, {
+          event_type: 'task_added',
+          state_before: { task_count: tasks.value.length },
+          state_after: { task_count: tasks.value.length + 2 },
+        })
+      } catch (error) {
+        simulationError.value = error.message || '新增任务事件回写失败。'
+      }
+    }
   }
 }
 
 function resetSimulation() {
+  if (simulationRunId.value && isRunning.value) {
+    updateSimulationRun(simulationRunId.value, { status: 'cancelled' }).catch(() => {})
+  }
   clearInterval(simulationTimer.value)
   isRunning.value = false
+  simulationRunId.value = null
+  simulationError.value = ''
   failedUav.value = ''
   simulationProgress.value = 72
   simulationStatus.value = '已完成首轮规划'
@@ -402,6 +660,13 @@ function downloadReport() {
 onUnmounted(() => {
   clearInterval(simulationTimer.value)
   if (imagePreview.value) URL.revokeObjectURL(imagePreview.value)
+})
+
+onMounted(() => {
+  loadMissionList()
+  loadTaskPointList()
+  loadDisasterCategories()
+  loadHealth()
 })
 </script>
 
@@ -443,8 +708,8 @@ onUnmounted(() => {
       <div class="sidebar-divider"></div>
       <div class="sidebar-section-label">运行状态 / STATUS</div>
       <div class="system-status">
-        <span class="status-dot"></span>
-        <div><strong>系统运行正常</strong><small>模型服务按需加载</small></div>
+        <span class="status-dot" :class="{ 'status-dot-error': healthStatus?.status === 'error' }"></span>
+        <div><strong>{{ healthLoading ? '正在检查服务' : healthStatus?.status === 'error' ? '接口连接异常' : '系统运行正常' }}</strong><small>{{ healthStatus?.model?.status === 'ready' ? '模型依赖和权重已就绪' : '模型服务按需加载' }}</small></div>
       </div>
       <div class="model-status">
         <div class="status-line"><span>模型</span><strong>FloodNet · 10 类分割</strong></div>
@@ -506,10 +771,13 @@ onUnmounted(() => {
           <div class="two-column-grid">
             <article class="panel recent-panel">
               <div class="panel-heading"><div><span class="panel-kicker">LATEST MISSION</span><h2>最近一次任务</h2></div><button class="text-button" @click="openView('simulation')">查看仿真 <span>→</span></button></div>
-              <div class="mission-summary">
+              <div v-if="missionLoading" class="table-state home-inline-state"><span class="loading-ring"></span><strong>正在读取最近任务…</strong></div>
+              <div v-else-if="missionError" class="table-state table-error home-inline-state"><span>!</span><strong>{{ missionError }}</strong><button class="text-button" @click="loadMissionList">重试 <span>↻</span></button></div>
+              <button v-else-if="missionRows.length" class="mission-summary mission-summary-button" @click="openMissionDetail(missionRows[0].id)">
                 <div class="mission-map mini-map"><span class="mini-route route-one"></span><span class="mini-route route-two"></span><i class="mini-point p-one"></i><i class="mini-point p-two"></i><i class="mini-point p-three"></i></div>
-                <div class="mission-info"><div class="mission-title"><strong>洪涝灾情复查 · 0217</strong><span class="success-tag">已完成 72%</span></div><p>FloodNet / 东部试验区 / 6 个复查任务点</p><div class="progress-track"><span style="width: 72%"></span></div><div class="mission-foot"><span>3 架无人机</span><span>运行 08:42</span><span>风险加权 PSO</span></div></div>
-              </div>
+                <div class="mission-info"><div class="mission-title"><strong>{{ missionRows[0].name }}</strong><span class="success-tag">{{ missionRows[0].status_label || missionRows[0].status }}</span></div><p>{{ missionRows[0].input_image_path || '尚未关联航拍图像' }}</p><div class="progress-track"><span :style="{ width: missionRows[0].status === 'completed' ? '100%' : '42%' }"></span></div><div class="mission-foot"><span>{{ missionTaskPoints.length || '—' }} 个任务点</span><span>Mission #{{ missionRows[0].id }}</span><span>点击查看详情</span></div></div>
+              </button>
+              <div v-else class="table-state home-inline-state"><span>∅</span><strong>暂无任务记录</strong><button class="text-button" @click="openView('recognition')">上传图片创建任务 <span>→</span></button></div>
             </article>
 
             <article class="panel event-panel">
@@ -522,6 +790,50 @@ onUnmounted(() => {
             <div class="workflow-heading"><div><span class="panel-kicker">WORKFLOW</span><h2>从图像到行动</h2></div><span>04 STEPS</span></div>
             <div class="workflow-steps"><div class="workflow-step done"><span>01</span><div><strong>航拍识别</strong><small>提取灾情区域</small></div></div><i>→</i><div class="workflow-step done"><span>02</span><div><strong>任务生成</strong><small>计算复查优先级</small></div></div><i>→</i><div class="workflow-step active"><span>03</span><div><strong>协同调度</strong><small>规划多机航线</small></div></div><i>→</i><div class="workflow-step"><span>04</span><div><strong>动态复查</strong><small>响应突发事件</small></div></div></div>
           </section>
+        </section>
+
+        <section v-else-if="activeView === 'missions'" class="view-stack">
+          <div class="data-view-toolbar">
+            <div class="data-view-context"><span class="database-pulse"></span><span>MISSION CENTER</span><b>任务列表来自 Django API</b></div>
+            <button class="outline-button" :disabled="missionLoading" @click="loadMissionList">{{ missionLoading ? '读取中…' : '刷新任务' }} <span>↻</span></button>
+          </div>
+          <article class="panel mission-list-panel">
+            <div class="panel-heading"><div><span class="panel-kicker">MISSION CENTER / LIST</span><h2>复查任务</h2></div><span class="table-note">{{ missionCount }} RECORDS</span></div>
+            <div class="resource-filter-row">
+              <label>任务状态<select v-model="missionStatusFilter" @change="loadMissionList"><option value="">全部状态</option><option value="created">已创建</option><option value="inferencing">识别中</option><option value="ready">待调度</option><option value="planning">规划中</option><option value="running">执行中</option><option value="completed">已完成</option><option value="failed">失败</option></select></label>
+              <button class="text-button" @click="openView('recognition')">上传图片创建任务 <span>→</span></button>
+            </div>
+            <div v-if="missionLoading" class="table-state"><span class="loading-ring"></span><strong>正在读取任务列表…</strong></div>
+            <div v-else-if="missionError" class="table-state table-error"><span>!</span><strong>{{ missionError }}</strong><button class="text-button" @click="loadMissionList">重试 <span>↻</span></button></div>
+            <div v-else-if="!missionRows.length" class="table-state"><span>∅</span><strong>暂无复查任务</strong><small>上传一张航拍图片即可创建第一条任务。</small><button class="solid-button compact" @click="openView('recognition')">开始上传 <span>→</span></button></div>
+            <div v-else class="mission-card-list">
+              <button v-for="mission in missionRows" :key="mission.id" class="mission-card-row" @click="openMissionDetail(mission.id)">
+                <span class="mission-card-index">#{{ mission.id }}</span>
+                <span class="mission-card-main"><strong>{{ mission.name }}</strong><small>{{ mission.input_image_path || '尚未关联图片' }}</small></span>
+                <span class="status-chip" :class="`status-${mission.status}`">{{ mission.status_label || mission.status }}</span>
+                <span class="mission-card-date">{{ formatCell(mission.created_at, { type: 'date' }) }}</span>
+                <span class="mission-card-arrow">→</span>
+              </button>
+            </div>
+          </article>
+        </section>
+
+        <section v-else-if="activeView === 'mission_detail'" class="view-stack">
+          <div class="detail-toolbar"><button class="outline-button" @click="backToMissionList">← 返回任务列表</button><span class="detail-context">MISSION CENTER / DETAIL</span></div>
+          <div v-if="missionDetailLoading" class="panel table-state detail-state"><span class="loading-ring"></span><strong>正在读取任务详情…</strong></div>
+          <div v-else-if="missionDetailError" class="panel table-state table-error detail-state"><span>!</span><strong>{{ missionDetailError }}</strong><button class="text-button" @click="loadMissionDetail(selectedMissionId)">重试 <span>↻</span></button></div>
+          <div v-else-if="!missionDetail" class="panel table-state detail-state"><span>∅</span><strong>未找到任务</strong><button class="text-button" @click="backToMissionList">返回列表</button></div>
+          <template v-else>
+            <article class="panel mission-detail-header">
+              <div><span class="panel-kicker">MISSION #{{ missionDetail.id }}</span><h2>{{ missionDetail.name }}</h2><p>创建于 {{ formatCell(missionDetail.created_at, { type: 'date' }) }} · 模型 ID {{ missionDetail.model_artifact_id || '—' }}</p></div>
+              <div class="detail-actions"><span class="status-chip" :class="`status-${missionDetail.status}`">{{ missionDetail.status_label || missionDetail.status }}</span><select :value="missionDetail.status" @change="changeMissionStatus($event.target.value)"><option value="created">已创建</option><option value="ready">待调度</option><option value="planning">规划中</option><option value="running">执行中</option><option value="completed">已完成</option><option value="failed">失败</option></select></div>
+            </article>
+            <div class="detail-grid">
+              <article class="panel detail-asset-card"><div class="panel-heading"><div><span class="panel-kicker">MISSION ASSETS</span><h2>任务文件</h2></div></div><dl class="detail-dl"><div><dt>输入图像</dt><dd>{{ missionDetail.input_image_path || '—' }}</dd></div><div><dt>识别 Mask</dt><dd>{{ missionDetail.mask_path || '尚未生成' }}</dd></div><div><dt>更新时间</dt><dd>{{ formatCell(missionDetail.updated_at, { type: 'date' }) }}</dd></div></dl></article>
+              <article class="panel detail-asset-card"><div class="panel-heading"><div><span class="panel-kicker">RELATED RUNS</span><h2>仿真运行</h2></div><span class="table-note">{{ missionSimulationRuns.length }}</span></div><div v-if="!missionSimulationRuns.length" class="inline-empty">暂无关联仿真记录</div><div v-else class="related-list"><div v-for="run in missionSimulationRuns" :key="run.id"><strong>#{{ run.id }} · {{ run.planning_method_label || run.planning_method }}</strong><span>{{ run.status_label || run.status }}</span></div></div></article>
+            </div>
+            <article class="panel detail-task-card"><div class="panel-heading"><div><span class="panel-kicker">TASK POINTS</span><h2>关联任务点</h2></div><span class="table-note">{{ missionTaskPoints.length }}</span></div><div v-if="!missionTaskPoints.length" class="table-state compact-state"><span>∅</span><strong>该任务还没有任务点</strong><small>当前识别接口会保存 Mission，任务点需要后续任务生成流程写入。</small></div><div v-else class="real-data-table-wrap"><table class="real-data-table"><thead><tr><th>编号</th><th>灾情类别</th><th>置信度</th><th>优先级</th><th>状态</th><th>无人机</th></tr></thead><tbody><tr v-for="point in missionTaskPoints" :key="point.id"><td>#{{ point.id }}</td><td>{{ point.disaster_category_label || point.disaster_category }}</td><td>{{ formatCell(point.confidence, { type: 'percent' }) }}</td><td>{{ point.priority }}</td><td>{{ point.status_label || point.status }}</td><td>{{ point.assigned_uav_id || '—' }}</td></tr></tbody></table></div></article>
+          </template>
         </section>
 
         <section v-else-if="activeView === 'recognition'" class="view-stack">
@@ -538,7 +850,8 @@ onUnmounted(() => {
                 </template>
               </div>
               <div class="upload-foot"><span v-if="uploadedName" class="selected-file"><i></i>{{ uploadedName }}</span><span v-else>支持 JPG、PNG · 最大 20 MB</span><button class="text-button" @click.stop="openFilePicker">选择文件 <span>＋</span></button></div>
-              <button class="wide-button" :disabled="isProcessing" @click="runRecognition">{{ isProcessing ? '模型推理中…' : recognitionReady ? '重新运行识别' : '开始识别' }} <span>→</span></button>
+              <button class="wide-button" :disabled="isProcessing" @click="runRecognition">{{ isProcessing ? (uploadStage || '处理中…') : recognitionReady ? '重新运行识别' : '上传并开始识别' }} <span>→</span></button>
+              <p v-if="uploadStage" class="upload-stage"><span class="loading-ring"></span>{{ uploadStage }}</p>
               <p v-if="recognitionError" class="form-error">{{ recognitionError }}</p>
             </article>
 
@@ -553,7 +866,7 @@ onUnmounted(() => {
         </section>
 
         <section v-else-if="activeView === 'simulation'" class="view-stack">
-          <div class="simulation-toolbar"><div class="algorithm-select"><span>当前策略</span><div class="algorithm-options"><button v-for="algorithm in ['最近邻', '标准 PSO', '风险加权 PSO']" :key="algorithm" :class="{ selected: selectedAlgorithm === algorithm }" @click="selectedAlgorithm = algorithm">{{ algorithm }}</button></div></div><div class="simulation-actions"><button class="outline-button" @click="resetSimulation">重置场景</button><button class="solid-button" :class="{ running: isRunning }" @click="startSimulation">{{ isRunning ? '运行中…' : '开始仿真' }} <span>{{ isRunning ? '◌' : '▶' }}</span></button></div></div>
+          <div class="simulation-toolbar"><div class="algorithm-select"><span>当前策略</span><div class="algorithm-options"><button v-for="algorithm in ['最近邻', '标准 PSO', '风险加权 PSO']" :key="algorithm" :class="{ selected: selectedAlgorithm === algorithm }" @click="selectedAlgorithm = algorithm">{{ algorithm }}</button></div></div><div class="simulation-actions"><button class="outline-button" @click="resetSimulation">重置场景</button><button class="solid-button" :class="{ running: isRunning }" @click="startSimulation">{{ isRunning ? '运行中…' : '开始仿真' }} <span>{{ isRunning ? '◌' : '▶' }}</span></button></div></div><p v-if="simulationError" class="form-error simulation-error" role="alert">{{ simulationError }}</p>
           <div class="simulation-layout">
             <article class="panel map-panel"><div class="panel-heading"><div><span class="panel-kicker">LIVE MAP / 02D</span><h2>协同航线与任务态势</h2></div><div class="map-status"><i></i>{{ simulationStatus }}</div></div><div class="map-canvas"><svg viewBox="0 0 760 420" role="img" aria-label="多无人机调度地图"><defs><pattern id="mapGrid" width="38" height="38" patternUnits="userSpaceOnUse"><rect width="38" height="38" fill="#111d2a"/><path d="M 38 0 L 0 0 0 38" fill="none" stroke="#203243" stroke-width="1"/></pattern></defs><rect width="760" height="420" fill="url(#mapGrid)"/><path d="M0 130 C120 90 210 180 310 138 S510 88 760 134" fill="none" stroke="#2c5260" stroke-width="58" opacity=".32"/><path d="M0 130 C120 90 210 180 310 138 S510 88 760 134" fill="none" stroke="#426a72" stroke-width="2" stroke-dasharray="9 9" opacity=".65"/><path d="M18 350 C150 298 210 354 330 310 S540 302 742 350" fill="none" stroke="#344d5b" stroke-width="34" opacity=".4"/><g class="route-layer"><path v-for="uav in uavs" :key="`${uav.id}-route`" :d="routePath(uav.route)" fill="none" :stroke="uav.color" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" :opacity="uav.status === '故障退出' ? .22 : .88" stroke-dasharray="7 5"/></g><g v-for="task in tasks" :key="task.id" class="map-task" :class="{ 'task-selected': activeTask.id === task.id }" @click="toggleTask(task)"><circle :cx="task.x" :cy="task.y" r="13" fill="#172333" stroke="#eef2dd" stroke-width="1" opacity=".95"/><circle :cx="task.x" :cy="task.y" r="5" :fill="task.status === '已完成' ? '#78d5c5' : task.level === '高' ? '#ef8d73' : '#e4bc70'"/><text :x="task.x + 18" :y="task.y + 4" fill="#aab7b1" font-size="11">{{ task.id }}</text></g><g v-for="uav in uavs" :key="uav.id" class="uav-marker" :class="{ 'uav-failed': uav.status === '故障退出' }" :transform="`translate(${uav.x} ${uav.y})`"><circle r="18" fill="#111d2a" :stroke="uav.color" stroke-width="2"/><path d="M-7 0 L0 -5 L7 0 L0 5Z" :fill="uav.color"/><text x="22" y="4" fill="#edf0e4" font-size="11">{{ uav.id }}</text></g></svg><div class="map-scale">0 —— 100m</div><div class="map-legend"><span><i class="legend-line teal"></i>UAV-01</span><span><i class="legend-line orange"></i>UAV-02</span><span><i class="legend-line purple"></i>UAV-03</span><span><i class="legend-point"></i>任务点</span></div></div><div class="map-footer"><span><i class="pulse-dot"></i>同步频率 2s</span><span>坐标系 / SIM-LOCAL</span><span>任务完成 {{ completedCount }}/{{ tasks.length }}</span></div></article>
             <aside class="simulation-side"><article class="panel uav-panel"><div class="panel-heading"><div><span class="panel-kicker">FLEET STATUS</span><h2>机队状态</h2></div><span class="count-label">{{ uavs.length }} AIRCRAFT</span></div><div class="uav-list"><div v-for="uav in uavs" :key="uav.id" class="uav-card" :class="{ failed: uav.status === '故障退出' }"><div class="uav-card-top"><span class="uav-color" :style="{ background: uav.color }"></span><div><strong>{{ uav.id }}</strong><small>{{ uav.name }}</small></div><span class="uav-state">{{ uav.status }}</span></div><div class="battery-row"><span>电量</span><div class="battery-track"><i :style="{ width: `${uav.battery}%`, background: uav.color }"></i></div><b>{{ uav.battery }}%</b></div><div class="uav-meta"><span>分配任务 <b>{{ uav.assigned }}</b></span><span>返航余量 <b>{{ Math.max(10, uav.battery - 18) }}%</b></span></div></div></div></article><article class="panel event-panel simulation-events"><div class="panel-heading"><div><span class="panel-kicker">EVENT INJECTION</span><h2>事件模拟</h2></div><span class="event-help">用于演示</span></div><div class="event-buttons"><button @click="triggerEvent('故障')"><span class="event-button-icon danger">×</span><div><strong>UAV-02 故障</strong><small>模拟退出并重规划</small></div><span>→</span></button><button @click="triggerEvent('新增')"><span class="event-button-icon add">＋</span><div><strong>新增复查任务</strong><small>生成增量航线</small></div><span>→</span></button></div></article></aside>
@@ -566,6 +879,18 @@ onUnmounted(() => {
           <div class="experiment-cards"><article v-for="item in experiments" :key="item.method" class="experiment-card" :class="`experiment-${item.tone}`"><div class="experiment-card-top"><span>{{ item.tag }}</span><i v-if="item.tone === 'lime'">PROPOSED</i></div><strong>{{ item.completion }}<small>%</small></strong><span>重点任务完成率</span><div class="experiment-bar"><i :style="{ width: `${item.completion}%` }"></i></div><p>{{ item.method }}</p></article></div>
           <article class="panel comparison-panel"><div class="panel-heading"><div><span class="panel-kicker">BENCHMARK TABLE</span><h2>调度结果对比</h2></div><span class="table-note">同一仿真场景 / N = 30</span></div><div class="comparison-table"><div class="comparison-head"><span>方法</span><span>重点任务完成率</span><span>总完成时间</span><span>总航程</span><span>故障恢复率</span></div><div v-for="item in experiments" :key="`${item.method}-row`" class="comparison-row"><span><i :class="`method-dot ${item.tone}`"></i><strong>{{ item.method }}</strong><small>{{ item.tag }}</small></span><span><b>{{ item.completion }}%</b><div class="table-bar"><i :class="item.tone" :style="{ width: `${item.completion}%` }"></i></div></span><span>{{ item.time }}</span><span>{{ item.distance }}</span><span :class="{ 'highlight-value': item.tone === 'lime' }">{{ item.recovery }}</span></div></div></article>
           <div class="ablation-grid"><article class="panel ablation-card"><div class="panel-heading"><div><span class="panel-kicker">ABLATION 01</span><h2>移除不确定性评分</h2></div><span class="loss-tag">−12.4%</span></div><p>没有识别置信度作为优先级因素时，高风险区域的发现顺序变慢。</p><div class="ablation-chart"><span style="height: 48%"></span><span style="height: 64%"></span><span style="height: 56%"></span><span style="height: 76%"></span><span style="height: 68%"></span><span style="height: 84%"></span></div><div class="chart-labels"><span>完成时间</span><span>高优任务率</span><span>恢复率</span></div></article><article class="panel ablation-card"><div class="panel-heading"><div><span class="panel-kicker">ABLATION 02</span><h2>移除动态重调度</h2></div><span class="loss-tag">−18.7%</span></div><p>故障发生后保留静态分配，会造成剩余无人机闲置和任务延误。</p><div class="ablation-chart purple-chart"><span style="height: 70%"></span><span style="height: 42%"></span><span style="height: 61%"></span><span style="height: 34%"></span><span style="height: 51%"></span><span style="height: 27%"></span></div><div class="chart-labels"><span>完成时间</span><span>高优任务率</span><span>恢复率</span></div></article></div>
+        </section>
+
+        <section v-else-if="activeView === 'task_points'" class="view-stack">
+          <div class="data-view-toolbar"><div class="data-view-context"><span class="database-pulse"></span><span>TASK POINTS</span><b>灾情区域和复查优先级</b></div><button class="outline-button" :disabled="taskPointLoading" @click="loadTaskPointList">{{ taskPointLoading ? '读取中…' : '刷新任务点' }} <span>↻</span></button></div>
+          <article class="panel task-point-list-panel">
+            <div class="panel-heading"><div><span class="panel-kicker">MISSION CENTER / TASK POINTS</span><h2>任务点台账</h2></div><span class="table-note">{{ taskPointCount }} RECORDS</span></div>
+            <div class="resource-filter-row"><label>灾情类别<select v-model="taskPointCategoryFilter" @change="loadTaskPointList"><option value="">全部类别</option><option v-for="item in disasterCategoryOptions" :key="item.value" :value="item.value">{{ item.label }}（{{ item.count }}）</option></select></label><label>任务状态<select v-model="taskPointStatusFilter" @change="loadTaskPointList"><option value="">全部状态</option><option value="pending">待复查</option><option value="assigned">已分配</option><option value="in_progress">执行中</option><option value="completed">已完成</option><option value="cancelled">已取消</option></select></label></div>
+            <div v-if="taskPointLoading" class="table-state"><span class="loading-ring"></span><strong>正在读取任务点…</strong></div>
+            <div v-else-if="taskPointError" class="table-state table-error"><span>!</span><strong>{{ taskPointError }}</strong><button class="text-button" @click="loadTaskPointList">重试 <span>↻</span></button></div>
+            <div v-else-if="!taskPointRows.length" class="table-state"><span>∅</span><strong>暂无任务点数据</strong><small>识别结果生成任务点后，数据会显示在这里。</small></div>
+            <div v-else class="real-data-table-wrap"><table class="real-data-table"><thead><tr><th>编号</th><th>任务 ID</th><th>灾情类别</th><th>坐标</th><th>面积</th><th>置信度</th><th>优先级</th><th>状态</th></tr></thead><tbody><tr v-for="point in taskPointRows" :key="point.id" class="clickable-row" @click="openMissionDetail(point.mission_id)"><td>#{{ point.id }}</td><td>#{{ point.mission_id }}</td><td>{{ point.disaster_category_label || point.disaster_category }}</td><td>({{ point.coordinate_x }}, {{ point.coordinate_y }})</td><td>{{ point.area }}</td><td>{{ formatCell(point.confidence, { type: 'percent' }) }}</td><td class="cell-emphasis">{{ point.priority }}</td><td>{{ point.status_label || point.status }}</td></tr></tbody></table></div>
+          </article>
         </section>
 
         <section v-else-if="isDataView" class="view-stack">
