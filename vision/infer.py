@@ -28,7 +28,9 @@ class ModelUnavailable(RuntimeError):
 class FloodNetInferenceEngine:
     def __init__(self, weight_path: str | None = None, input_size: int = 512):
         self.weight_path = weight_path or os.environ.get('FLOODNET_MODEL_PATH', 'floodnet_deeplabv3.pt')
-        self.input_size = int(input_size)
+        # Railway 等 CPU 小实例默认使用更小的推理尺寸，避免 512×512 的
+        # DeepLabV3 中间特征占满内存；本地或更大实例可通过环境变量恢复尺寸。
+        self.input_size = int(os.environ.get('FLOODNET_INPUT_SIZE', input_size))
         self._model = None
         self._torch = None
         self._device = None
@@ -72,13 +74,21 @@ class FloodNetInferenceEngine:
             if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
                 state_dict = checkpoint['state_dict']
                 self._num_classes = int(checkpoint.get('num_classes', self._num_classes))
-                self.input_size = int(checkpoint.get('input_size', self.input_size))
+                checkpoint_input_size = int(checkpoint.get('input_size', self.input_size))
+                if not os.environ.get('FLOODNET_INPUT_SIZE'):
+                    self.input_size = checkpoint_input_size
             else:
                 state_dict = checkpoint
             if isinstance(state_dict, dict) and state_dict and all(key.startswith('module.') for key in state_dict):
                 state_dict = {key[7:]: value for key, value in state_dict.items()}
             model = build_model(num_classes=self._num_classes, pretrained=False)
             model.load_state_dict(state_dict)
+            torch.set_num_threads(int(os.environ.get('TORCH_NUM_THREADS', '1')))
+            try:
+                torch.set_num_interop_threads(int(os.environ.get('TORCH_NUM_INTEROP_THREADS', '1')))
+            except RuntimeError:
+                # 线程池已经初始化时，保持 PyTorch 当前配置即可。
+                pass
             self._device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             self._model = model.to(self._device).eval()
             self._torch = torch
