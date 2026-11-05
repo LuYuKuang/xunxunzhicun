@@ -8,6 +8,8 @@ import {
   fetchResource,
   createSimulationEvent,
   createSimulationRun,
+  previewPlan,
+  replanSimulation,
   recognizeImage,
   updateSimulationRun,
   updateMission,
@@ -31,6 +33,7 @@ const simulationProgress = ref(72)
 const simulationStatus = ref('已完成首轮规划')
 const simulationTimer = ref(null)
 const simulationRunId = ref(null)
+const simulationPlan = ref(null)
 const simulationError = ref('')
 const failedUav = ref('')
 const dataMenuOpen = ref(true)
@@ -264,11 +267,15 @@ const currentTable = computed(() => dataTableConfigs[activeView.value])
 const completedCount = computed(() => tasks.value.filter((task) => task.status === '已完成').length)
 const progressLabel = computed(() => `${Math.round(simulationProgress.value)}%`)
 const activeTask = computed(() => selectedTask.value || tasks.value[0])
+const plannerMetrics = computed(() => simulationPlan.value?.metrics || {})
+const plannerCompletionLabel = computed(() => simulationPlan.value ? `${Math.round(Number(plannerMetrics.value.focus_task_completion_rate || plannerMetrics.value.completion_rate || 0) * 100)}%` : '—')
+const plannerDistanceLabel = computed(() => simulationPlan.value ? `${Number(plannerMetrics.value.total_distance || 0).toFixed(1)} m` : '—')
+const plannerTimeLabel = computed(() => simulationPlan.value ? `${Number(plannerMetrics.value.total_time || 0).toFixed(1)} s` : '—')
 const stats = computed(() => [
   { label: '识别置信度', value: recognitionReady.value ? `${((recognitionResult.value?.mean_confidence || 0) * 100).toFixed(1)}%` : '—', delta: recognitionReady.value ? `${recognitionResult.value?.device || 'CPU'} 推理` : '等待输入', icon: '◎', tone: 'teal' },
   { label: '复查任务点', value: `${tasks.value.length}`, delta: `${completedCount.value} 已完成`, icon: '⌖', tone: 'orange' },
-  { label: '重点任务完成率', value: `${experiments[3].completion}%`, delta: '风险加权 PSO', icon: '↗', tone: 'purple' },
-  { label: '预计总航程', value: '3.18 km', delta: '较基线 -34.6%', icon: '⌁', tone: 'lime' },
+  { label: '重点任务完成率', value: plannerCompletionLabel.value, delta: simulationPlan.value ? `${simulationPlan.value.algorithm} 实时计划` : '等待调度', icon: '↗', tone: 'purple' },
+  { label: '预计总航程', value: plannerDistanceLabel.value, delta: simulationPlan.value ? '来自当前计划' : '等待调度', icon: '⌁', tone: 'lime' },
 ])
 
 function cloneUavs(source) {
@@ -494,6 +501,7 @@ function toggleTask(task) {
 }
 
 const planningMethodValues = {
+  平均分配: 'round_robin',
   最近邻: 'nearest',
   '标准 PSO': 'pso',
   '风险加权 PSO': 'risk_aware_pso',
@@ -525,6 +533,23 @@ function simulationUavSnapshot() {
   }))
 }
 
+function applyPlanToScene(plan) {
+  if (!plan?.routes) return
+  const assignments = plan.assignments || {}
+  tasks.value.forEach((task) => {
+    const assigned = Object.values(assignments).some((items) => items.includes(task.id))
+    if (assigned && task.status !== '已完成') task.status = '执行中'
+  })
+  uavs.value.forEach((uav) => {
+    const route = plan.routes[uav.id]
+    if (!route) return
+    const points = [route.start, ...(route.tasks || []), route.return].filter(Boolean)
+    uav.route = points.map((point) => [Number(point.x), Number(point.y)])
+    uav.assigned = (route.tasks || []).length
+    if (uav.status !== '故障退出') uav.status = uav.assigned ? '执行中' : '待命'
+  })
+}
+
 async function finishSimulation() {
   const runId = simulationRunId.value
   isRunning.value = false
@@ -538,9 +563,11 @@ async function finishSimulation() {
       status: 'completed',
       summary_metrics: {
         completion_rate: tasks.value.length ? completedCount.value / tasks.value.length : 0,
-        planned_distance_km: 3.18,
+        planned_distance_km: Number(((simulationPlan.value?.metrics?.total_distance || 0) / 100).toFixed(3)),
         task_count: tasks.value.length,
         uav_count: uavs.value.length,
+        ...(simulationPlan.value?.metrics || {}),
+        planner: simulationPlan.value || {},
       },
     })
     if (missionDetail.value?.id === run.mission_id) {
@@ -565,14 +592,26 @@ async function startSimulation() {
   simulationProgress.value = 8
   clearInterval(simulationTimer.value)
   try {
+    const planningMethod = planningMethodValues[selectedAlgorithm.value] || 'risk_aware_pso'
+    const plan = await previewPlan({
+      mission_id: missionId,
+      algorithm: planningMethod,
+      random_seed: 42,
+      tasks: simulationTaskSnapshot(),
+      uav_configuration: simulationUavSnapshot(),
+      map_state: { width: 760, height: 420, home: { x: 80, y: 360 } },
+      config: { population_size: 16, iterations: 24, energy_per_distance: 0.08 },
+    })
+    simulationPlan.value = plan
+    applyPlanToScene(plan)
     const run = await createSimulationRun({
       mission_id: missionId,
-      planning_method: planningMethodValues[selectedAlgorithm.value] || 'risk_aware_pso',
+      planning_method: planningMethod,
       random_seed: 42,
       status: 'running',
       uav_configuration: simulationUavSnapshot(),
       task_snapshot: simulationTaskSnapshot(),
-      summary_metrics: {},
+      summary_metrics: { ...(plan.metrics || {}), objective_value: plan.objective_value, planner: plan },
     })
     simulationRunId.value = run.id
     simulationStatus.value = `仿真运行中 · #${run.id}`
@@ -604,25 +643,40 @@ async function triggerEvent(type) {
     eventLog.value.unshift({ time: '刚刚', title: 'UAV-02 故障退出', detail: '剩余任务已重新分配给 UAV-01 / UAV-03', tone: 'danger' })
     if (runId) {
       try {
-        await createSimulationEvent(runId, {
+        const plan = await replanSimulation(runId, {
           event_type: 'uav_failure',
-          state_before: { uavs: simulationUavSnapshot() },
-          state_after: { failed_uav: 'UAV-02', uavs: simulationUavSnapshot() },
+          uav_id: 'UAV-02',
+          config: { algorithm: 'risk_aware_pso', random_seed: 42, population_size: 16, iterations: 20 },
         })
+        simulationPlan.value = plan
+        applyPlanToScene(plan)
       } catch (error) {
         simulationError.value = error.message || '故障事件回写失败。'
       }
     }
   } else {
+    const newTask = {
+      id: `T-${String(tasks.value.length + 1).padStart(3, '0')}`,
+      label: '新增临时复查点',
+      type: '受淹区域',
+      level: '高',
+      score: 0.82,
+      status: '待复查',
+      x: 460,
+      y: 180,
+    }
+    tasks.value.push(newTask)
     simulationStatus.value = '新增任务等待分配'
-    eventLog.value.unshift({ time: '刚刚', title: '新增 2 个复查任务', detail: '调度器正在计算最短增量航线', tone: 'orange' })
+    eventLog.value.unshift({ time: '刚刚', title: '新增 1 个复查任务', detail: '调度器正在计算最短增量航线', tone: 'orange' })
     if (runId) {
       try {
-        await createSimulationEvent(runId, {
+        const plan = await replanSimulation(runId, {
           event_type: 'task_added',
-          state_before: { task_count: tasks.value.length },
-          state_after: { task_count: tasks.value.length + 2 },
+          task: { id: newTask.id, x: newTask.x, y: newTask.y, category: 'flooded_area', area: 3, confidence: newTask.score, priority: 12, status: 'pending' },
+          config: { algorithm: 'risk_aware_pso', random_seed: 42, population_size: 16, iterations: 20 },
         })
+        simulationPlan.value = plan
+        applyPlanToScene(plan)
       } catch (error) {
         simulationError.value = error.message || '新增任务事件回写失败。'
       }
@@ -637,6 +691,7 @@ function resetSimulation() {
   clearInterval(simulationTimer.value)
   isRunning.value = false
   simulationRunId.value = null
+  simulationPlan.value = null
   simulationError.value = ''
   failedUav.value = ''
   simulationProgress.value = 72
@@ -866,12 +921,12 @@ onMounted(() => {
         </section>
 
         <section v-else-if="activeView === 'simulation'" class="view-stack">
-          <div class="simulation-toolbar"><div class="algorithm-select"><span>当前策略</span><div class="algorithm-options"><button v-for="algorithm in ['最近邻', '标准 PSO', '风险加权 PSO']" :key="algorithm" :class="{ selected: selectedAlgorithm === algorithm }" @click="selectedAlgorithm = algorithm">{{ algorithm }}</button></div></div><div class="simulation-actions"><button class="outline-button" @click="resetSimulation">重置场景</button><button class="solid-button" :class="{ running: isRunning }" @click="startSimulation">{{ isRunning ? '运行中…' : '开始仿真' }} <span>{{ isRunning ? '◌' : '▶' }}</span></button></div></div><p v-if="simulationError" class="form-error simulation-error" role="alert">{{ simulationError }}</p>
+          <div class="simulation-toolbar"><div class="algorithm-select"><span>当前策略</span><div class="algorithm-options"><button v-for="algorithm in ['平均分配', '最近邻', '标准 PSO', '风险加权 PSO']" :key="algorithm" :class="{ selected: selectedAlgorithm === algorithm }" @click="selectedAlgorithm = algorithm">{{ algorithm }}</button></div></div><div class="simulation-actions"><button class="outline-button" @click="resetSimulation">重置场景</button><button class="solid-button" :class="{ running: isRunning }" @click="startSimulation">{{ isRunning ? '运行中…' : '开始仿真' }} <span>{{ isRunning ? '◌' : '▶' }}</span></button></div></div><p v-if="simulationError" class="form-error simulation-error" role="alert">{{ simulationError }}</p>
           <div class="simulation-layout">
             <article class="panel map-panel"><div class="panel-heading"><div><span class="panel-kicker">LIVE MAP / 02D</span><h2>协同航线与任务态势</h2></div><div class="map-status"><i></i>{{ simulationStatus }}</div></div><div class="map-canvas"><svg viewBox="0 0 760 420" role="img" aria-label="多无人机调度地图"><defs><pattern id="mapGrid" width="38" height="38" patternUnits="userSpaceOnUse"><rect width="38" height="38" fill="#111d2a"/><path d="M 38 0 L 0 0 0 38" fill="none" stroke="#203243" stroke-width="1"/></pattern></defs><rect width="760" height="420" fill="url(#mapGrid)"/><path d="M0 130 C120 90 210 180 310 138 S510 88 760 134" fill="none" stroke="#2c5260" stroke-width="58" opacity=".32"/><path d="M0 130 C120 90 210 180 310 138 S510 88 760 134" fill="none" stroke="#426a72" stroke-width="2" stroke-dasharray="9 9" opacity=".65"/><path d="M18 350 C150 298 210 354 330 310 S540 302 742 350" fill="none" stroke="#344d5b" stroke-width="34" opacity=".4"/><g class="route-layer"><path v-for="uav in uavs" :key="`${uav.id}-route`" :d="routePath(uav.route)" fill="none" :stroke="uav.color" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" :opacity="uav.status === '故障退出' ? .22 : .88" stroke-dasharray="7 5"/></g><g v-for="task in tasks" :key="task.id" class="map-task" :class="{ 'task-selected': activeTask.id === task.id }" @click="toggleTask(task)"><circle :cx="task.x" :cy="task.y" r="13" fill="#172333" stroke="#eef2dd" stroke-width="1" opacity=".95"/><circle :cx="task.x" :cy="task.y" r="5" :fill="task.status === '已完成' ? '#78d5c5' : task.level === '高' ? '#ef8d73' : '#e4bc70'"/><text :x="task.x + 18" :y="task.y + 4" fill="#aab7b1" font-size="11">{{ task.id }}</text></g><g v-for="uav in uavs" :key="uav.id" class="uav-marker" :class="{ 'uav-failed': uav.status === '故障退出' }" :transform="`translate(${uav.x} ${uav.y})`"><circle r="18" fill="#111d2a" :stroke="uav.color" stroke-width="2"/><path d="M-7 0 L0 -5 L7 0 L0 5Z" :fill="uav.color"/><text x="22" y="4" fill="#edf0e4" font-size="11">{{ uav.id }}</text></g></svg><div class="map-scale">0 —— 100m</div><div class="map-legend"><span><i class="legend-line teal"></i>UAV-01</span><span><i class="legend-line orange"></i>UAV-02</span><span><i class="legend-line purple"></i>UAV-03</span><span><i class="legend-point"></i>任务点</span></div></div><div class="map-footer"><span><i class="pulse-dot"></i>同步频率 2s</span><span>坐标系 / SIM-LOCAL</span><span>任务完成 {{ completedCount }}/{{ tasks.length }}</span></div></article>
             <aside class="simulation-side"><article class="panel uav-panel"><div class="panel-heading"><div><span class="panel-kicker">FLEET STATUS</span><h2>机队状态</h2></div><span class="count-label">{{ uavs.length }} AIRCRAFT</span></div><div class="uav-list"><div v-for="uav in uavs" :key="uav.id" class="uav-card" :class="{ failed: uav.status === '故障退出' }"><div class="uav-card-top"><span class="uav-color" :style="{ background: uav.color }"></span><div><strong>{{ uav.id }}</strong><small>{{ uav.name }}</small></div><span class="uav-state">{{ uav.status }}</span></div><div class="battery-row"><span>电量</span><div class="battery-track"><i :style="{ width: `${uav.battery}%`, background: uav.color }"></i></div><b>{{ uav.battery }}%</b></div><div class="uav-meta"><span>分配任务 <b>{{ uav.assigned }}</b></span><span>返航余量 <b>{{ Math.max(10, uav.battery - 18) }}%</b></span></div></div></div></article><article class="panel event-panel simulation-events"><div class="panel-heading"><div><span class="panel-kicker">EVENT INJECTION</span><h2>事件模拟</h2></div><span class="event-help">用于演示</span></div><div class="event-buttons"><button @click="triggerEvent('故障')"><span class="event-button-icon danger">×</span><div><strong>UAV-02 故障</strong><small>模拟退出并重规划</small></div><span>→</span></button><button @click="triggerEvent('新增')"><span class="event-button-icon add">＋</span><div><strong>新增复查任务</strong><small>生成增量航线</small></div><span>→</span></button></div></article></aside>
           </div>
-          <div class="simulation-metrics"><article class="metric-card"><span>仿真进度</span><strong>{{ progressLabel }}</strong><div class="metric-progress"><i :style="{ width: `${simulationProgress}%` }"></i></div></article><article class="metric-card"><span>重点任务完成率</span><strong>94<small>%</small></strong><em>+18.2% <small>vs baseline</small></em></article><article class="metric-card"><span>已规划总航程</span><strong>3.18<small>km</small></strong><em>−34.6% <small>vs baseline</small></em></article><article class="metric-card"><span>预计完成时间</span><strong>11:26</strong><em>−38.4% <small>vs baseline</small></em></article></div>
+          <div class="simulation-metrics"><article class="metric-card"><span>仿真进度</span><strong>{{ progressLabel }}</strong><div class="metric-progress"><i :style="{ width: `${simulationProgress}%` }"></i></div></article><article class="metric-card"><span>重点任务完成率</span><strong>{{ plannerCompletionLabel }}</strong><em>{{ simulationPlan ? '当前计划' : '等待计划' }}</em></article><article class="metric-card"><span>已规划总航程</span><strong>{{ plannerDistanceLabel }}</strong><em>{{ simulationPlan ? '二维仿真距离' : '等待计划' }}</em></article><article class="metric-card"><span>预计完成时间</span><strong>{{ plannerTimeLabel }}</strong><em>{{ simulationPlan ? '当前计划 makespan' : '等待计划' }}</em></article></div>
         </section>
 
         <section v-else-if="activeView === 'experiments'" class="view-stack">

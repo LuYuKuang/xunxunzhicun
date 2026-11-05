@@ -26,3 +26,4 @@ server {
         proxy_pass ${BACKEND_URL};
     }
 }
+

@@ -362,6 +362,55 @@ def health(request):
 
 @api_errors
 @require_http_methods(['POST'])
+def plans_preview(request):
+    """使用独立 planner 计算一次计划，不修改执行状态。"""
+    payload = _payload(request)
+    try:
+        from .planner_services import preview
+        result = preview(payload, payload.get('mission_id'))
+    except (ValueError, KeyError) as exc:
+        raise APIInputError(str(exc), 'planner_input_error') from exc
+    return _ok(result.to_dict())
+
+
+@api_errors
+@require_http_methods(['POST'])
+def task_generate(request):
+    """把识别区域摘要转换为可调度任务点。"""
+    payload = _payload(request)
+    mission_id = _required(payload, 'mission_id')
+    mission = _related(Mission, mission_id, 'mission_id')
+    regions = payload.get('regions')
+    if not isinstance(regions, list) or not regions:
+        raise APIInputError('regions 必须是非空数组。', 'missing_regions')
+    if payload.get('replace_pending'):
+        mission.task_points.filter(status=TaskPoint.Status.PENDING).delete()
+    from task.generate import regions_to_tasks
+    created = []
+    for region in regions_to_tasks(regions):
+        category = str(region.get('category', TaskPoint.DisasterCategory.FLOODED_AREA))
+        if category not in dict(TaskPoint.DisasterCategory.choices):
+            category = TaskPoint.DisasterCategory.FLOODED_AREA
+        item = TaskPoint(
+            mission=mission,
+            coordinate_x=_float_value(region, 'x', 0, minimum=0),
+            coordinate_y=_float_value(region, 'y', 0, minimum=0),
+            disaster_category=category,
+            area=_float_value(region, 'area', 0.0, minimum=0),
+            confidence=_float_value(region, 'confidence', 0.0, minimum=0, maximum=1),
+            priority=_int_value(region, 'priority', 0, minimum=0),
+            status=TaskPoint.Status.PENDING,
+        )
+        item.full_clean()
+        item.save()
+        created.append(_task_point_data(item))
+    mission.status = Mission.Status.READY
+    mission.save(update_fields=['status', 'updated_at'])
+    return _ok({'items': created, 'count': len(created), 'mission_id': mission.pk}, status=201)
+
+
+@api_errors
+@require_http_methods(['POST'])
 def upload_image(request):
     """保存一张航拍图像，并创建或更新一个待识别 Mission。"""
     uploaded = request.FILES.get('image')
@@ -753,6 +802,45 @@ def simulation_events(request, simulation_id):
     item.full_clean()
     item.save()
     return _ok(_simulation_event_data(item), status=201)
+
+
+@api_errors
+@require_http_methods(['POST'])
+def simulation_replan(request, simulation_id):
+    """根据仿真快照和事件调用 planner，只重新分配未完成任务。"""
+    simulation_run = _related(SimulationRun, simulation_id, 'simulation_id')
+    payload = _payload(request)
+    try:
+        from .planner_services import replan_simulation
+        result, before, summary = replan_simulation(simulation_run, payload, payload.get('config'))
+    except (ValueError, KeyError) as exc:
+        raise APIInputError(str(exc), 'planner_input_error') from exc
+    event_type = payload.get('event_type')
+    if event_type:
+        event_uav = None
+        if payload.get('uav_id') is not None:
+            raw_uav = str(payload['uav_id'])
+            event_uav = UAV.objects.filter(identifier=raw_uav).first()
+            if event_uav is None and raw_uav.isdigit():
+                event_uav = UAV.objects.filter(pk=int(raw_uav)).first()
+        event_task = None
+        if payload.get('task_point_id') is not None and str(payload['task_point_id']).isdigit():
+            event_task = TaskPoint.objects.filter(pk=int(payload['task_point_id'])).first()
+        SimulationEvent.objects.create(
+            simulation_run=simulation_run,
+            event_type=event_type,
+            uav=event_uav,
+            task_point=event_task,
+            state_before=before,
+            state_after=summary,
+        )
+    SimulationEvent.objects.create(
+        simulation_run=simulation_run,
+        event_type=SimulationEvent.EventType.REPLANNED,
+        state_before=before,
+        state_after=result.to_dict(),
+    )
+    return _ok(result.to_dict())
 
 
 @api_errors

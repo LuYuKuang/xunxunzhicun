@@ -5,16 +5,25 @@ __pycache__/
 db.sqlite3
 media/
 data/
-staticfiles/
+!data/.gitkeep
 vision/weights/*
 !vision/weights/.gitkeep
 frontend/node_modules/
 frontend/dist/
 .env
+
+# Local build artifacts and large generated files
 *.log
 *.whl
 *.tar.gz
 tmp/
-tmp_*
+tmp_*/
 output/
 site-deploy/
+.chart-data-*/
+.codex-finalizer-*/
+
+data/
+staticfiles/
+tmp_*
+

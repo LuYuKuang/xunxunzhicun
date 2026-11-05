@@ -102,6 +102,21 @@ export async function createSimulationRun(payload) {
   return parseResponse(response, '创建仿真运行失败')
 }
 
+/** 调用纯 Python planner 计算一次计划，不改变仿真执行状态。 */
+export async function previewPlan(payload) {
+  await ensureCsrf()
+  const response = await fetch(`${API_BASE}/plans/preview/`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      ...(csrfCookie() ? { 'X-CSRFToken': csrfCookie() } : {}),
+    },
+    body: JSON.stringify(payload),
+  })
+  return parseResponse(response, '调度计划计算失败')
+}
+
 /** 更新仿真状态和汇总指标。后端使用 query string 传递仿真 ID。 */
 export async function updateSimulationRun(simulationId, payload) {
   await ensureCsrf()
@@ -130,6 +145,21 @@ export async function createSimulationEvent(simulationId, payload) {
     body: JSON.stringify(payload),
   })
   return parseResponse(response, '记录仿真事件失败')
+}
+
+/** 触发事件并调用风险加权动态重规划。 */
+export async function replanSimulation(simulationId, payload = {}) {
+  await ensureCsrf()
+  const response = await fetch(`${API_BASE}/simulation-runs/${encodeURIComponent(simulationId)}/replan/`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      ...(csrfCookie() ? { 'X-CSRFToken': csrfCookie() } : {}),
+    },
+    body: JSON.stringify(payload),
+  })
+  return parseResponse(response, '动态重规划失败')
 }
 
 /** 上传一张图像并调用 FloodNet 语义分割模型。 */
