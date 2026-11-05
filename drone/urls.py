@@ -30,6 +30,7 @@ urlpatterns = [
     path('api/', include('core.urls', namespace='core-api')),
 ]
 
-if settings.DEBUG:
+# Railway 使用持久化卷保存上传图片；通过 Django 提供媒体文件，供前端反向代理访问。
+if settings.DEBUG or os.environ.get('DJANGO_SERVE_MEDIA', '1') == '1':
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
 
