@@ -2,7 +2,10 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    FLOODNET_INPUT_SIZE=256 \
+    TORCH_NUM_THREADS=1 \
+    TORCH_NUM_INTEROP_THREADS=1
 
 WORKDIR /app
 
@@ -16,9 +19,8 @@ ARG FLOODNET_WEIGHTS_SHA256=88a36f7df3b143f5263d6ad0245e801aca068f6687b3fd677a69
 RUN python -c "import hashlib, pathlib, urllib.request; target=pathlib.Path('vision/weights/floodnet_deeplabv3.pt'); target.parent.mkdir(parents=True, exist_ok=True); data=urllib.request.urlopen('${FLOODNET_WEIGHTS_URL}', timeout=180).read(); digest=hashlib.sha256(data).hexdigest(); expected='${FLOODNET_WEIGHTS_SHA256}'; assert digest == expected, f'权重 SHA256 不匹配: {digest} != {expected}'; target.write_bytes(data); print(f'downloaded {target} ({len(data)} bytes)')"
 
 RUN python manage.py collectstatic --noinput
-COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 8000
 
-CMD ["/app/entrypoint.sh"]
+CMD ["sh", "-c", "python manage.py migrate --noinput && gunicorn drone.wsgi:application --bind 0.0.0.0:${PORT:-8000} --access-logfile -"]
+
