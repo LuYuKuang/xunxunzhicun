@@ -22,5 +22,4 @@ if username and password:
     user.save()
 PY
 
-exec gunicorn drone.wsgi:application --bind 0.0.0.0:${PORT:-8000} --access-logfile -
-
+exec gunicorn drone.wsgi:application --bind 0.0.0.0:${PORT:-8000} --access-logfile - --workers ${GUNICORN_WORKERS:-1} --timeout ${GUNICORN_TIMEOUT:-120}
