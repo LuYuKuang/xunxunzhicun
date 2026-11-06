@@ -14,7 +14,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
-from django.db import IntegrityError, connection
+from django.db import IntegrityError, connection, transaction
 from django.db.models import Count
 from django.db.utils import DatabaseError
 from django.http import FileResponse, Http404, JsonResponse
@@ -256,6 +256,9 @@ def _mission_data(item):
         'name': item.name,
         'input_image_path': item.input_image_path,
         'mask_path': item.mask_path,
+        'image_width': item.image_width,
+        'image_height': item.image_height,
+        'inference_summary': item.inference_summary,
         'status': item.status,
         'status_label': item.get_status_display(),
         'model_artifact_id': item.model_artifact_id,
@@ -494,6 +497,16 @@ def vision_infer(request):
     mission.name = mission_name[:150]
     mission.input_image_path = image_rel
     mission.mask_path = mask_rel
+    mission.image_width = int(result.get('width') or 0) or None
+    mission.image_height = int(result.get('height') or 0) or None
+    mission.inference_summary = {
+        'class_stats': result.get('class_stats') or [],
+        'mean_confidence': result.get('mean_confidence'),
+        'flood_ratio': result.get('flood_ratio'),
+        'inference_ms': result.get('inference_ms'),
+        'device': result.get('device'),
+        'model_classes': result.get('model_classes'),
+    }
     mission.status = Mission.Status.READY
     mission.model_artifact = artifact
     mission.full_clean()
@@ -591,6 +604,121 @@ def missions(request):
     item.full_clean()
     item.save()
     return _ok(_mission_data(item), status=201)
+
+
+@api_errors
+@require_http_methods(['POST'])
+def mission_regions(request, mission_id):
+    """从一次识别任务的 palette mask 提取受淹区域像素坐标。"""
+    mission = _related(Mission, mission_id, 'mission_id')
+    payload = _payload(request)
+    try:
+        min_area_px = float(payload.get('min_area_px', 2000))
+        max_regions = int(payload.get('max_regions', 12))
+    except (TypeError, ValueError) as exc:
+        raise APIInputError('min_area_px 和 max_regions 必须是数字。', 'invalid_region_options') from exc
+    if min_area_px < 0 or max_regions < 1:
+        raise APIInputError('min_area_px 不能为负数，max_regions 必须大于 0。', 'invalid_region_options')
+    from .region_services import extract_flood_regions
+    return _ok(extract_flood_regions(mission, min_area_px=min_area_px, max_regions=max_regions))
+
+
+@api_errors
+@require_http_methods(['POST'])
+def mission_dispatch(request, mission_id):
+    """提取区域、落库任务点并计算一次图片坐标系下的调度计划。"""
+    mission = _related(Mission, mission_id, 'mission_id')
+    payload = _payload(request)
+    try:
+        min_area_px = float(payload.get('min_area_px', 2000))
+        max_regions = int(payload.get('max_regions', 12))
+        coordinate_scale = float(payload.get('coordinate_scale', 0.1))
+    except (TypeError, ValueError) as exc:
+        raise APIInputError('区域阈值、区域数量和坐标缩放必须是数字。', 'invalid_dispatch_options') from exc
+    if min_area_px < 0 or max_regions < 1 or coordinate_scale <= 0:
+        raise APIInputError('区域阈值、区域数量或坐标缩放不合法。', 'invalid_dispatch_options')
+
+    from .planner_services import mission_tasks, preview
+    from .region_services import extract_flood_regions
+    from task.generate import regions_to_tasks
+
+    extracted = extract_flood_regions(
+        mission,
+        min_area_px=min_area_px,
+        max_regions=max_regions,
+    )
+    if not extracted['regions']:
+        mission.status = Mission.Status.READY
+        mission.save(update_fields=['status', 'updated_at'])
+        return _ok({
+            'regions': [],
+            'tasks': [],
+            'plan': None,
+            'width': extracted['width'],
+            'height': extracted['height'],
+            'coordinate_scale': coordinate_scale,
+            'note': extracted['note'],
+        })
+
+    map_state = dict(payload.get('map_state') or {})
+    map_state.setdefault('width', extracted['width'])
+    map_state.setdefault('height', extracted['height'])
+    map_state.setdefault('home', {
+        'x': extracted['width'] * 0.5,
+        'y': extracted['height'] * 0.92,
+    })
+    generated_regions = [
+        {
+            **region,
+            'coordinate_x': region['x'],
+            'coordinate_y': region['y'],
+            'disaster_category': region['category'],
+            'area': region['area_px'],
+        }
+        for region in extracted['regions']
+    ]
+    created = []
+    with transaction.atomic():
+        if payload.get('replace_pending', True):
+            mission.task_points.filter(status=TaskPoint.Status.PENDING).delete()
+        for region in regions_to_tasks(generated_regions):
+            item = TaskPoint(
+                mission=mission,
+                coordinate_x=_float_value(region, 'x', 0, minimum=0),
+                coordinate_y=_float_value(region, 'y', 0, minimum=0),
+                disaster_category=region.get('category', TaskPoint.DisasterCategory.FLOODED_AREA),
+                area=_float_value(region, 'area', 0.0, minimum=0),
+                confidence=_float_value(region, 'confidence', 0.0, minimum=0, maximum=1),
+                priority=_int_value(region, 'priority', 0, minimum=0),
+                status=TaskPoint.Status.PENDING,
+            )
+            item.full_clean()
+            item.save()
+            created.append(_task_point_data(item))
+        mission.status = Mission.Status.READY
+        mission.save(update_fields=['status', 'updated_at'])
+
+    plan_payload = {
+        'mission_id': mission.pk,
+        'tasks': mission_tasks(mission.pk),
+        'uav_configuration': payload.get('uav_configuration') or payload.get('uavs') or [],
+        'map_state': map_state,
+        'coordinate_scale': coordinate_scale,
+        'algorithm': payload.get('algorithm') or payload.get('planning_method') or 'risk_aware_pso',
+        'random_seed': payload.get('random_seed', 42),
+        'config': payload.get('config') or {},
+    }
+    result = preview(plan_payload, mission.pk)
+    return _ok({
+        'regions': extracted['regions'],
+        'tasks': created,
+        'plan': result.to_dict(),
+        'width': extracted['width'],
+        'height': extracted['height'],
+        'map_state': map_state,
+        'coordinate_scale': coordinate_scale,
+        'note': extracted['note'],
+    }, status=201)
 
 
 @api_errors
