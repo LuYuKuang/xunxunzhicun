@@ -130,6 +130,27 @@ a { color: inherit; text-decoration: none; }
 @media (max-width: 900px) { .hero-card, .recognition-layout { grid-template-columns: 1fr; }.hero-visual { min-height: 230px; }.stats-grid { grid-template-columns: repeat(2, 1fr); }.two-column-grid { grid-template-columns: 1fr; }.simulation-layout { grid-template-columns: 1fr; }.simulation-side { grid-template-columns: 1fr 1fr; }.uav-list { grid-template-columns: repeat(3, 1fr); }.simulation-metrics { grid-template-columns: repeat(2, 1fr); }.experiment-cards { grid-template-columns: repeat(2, 1fr); }.workflow-steps { grid-template-columns: 1fr 1fr; gap: 18px; }.workflow-steps > i { display: none; }.workflow-step { padding: 8px 0; } }
 @media (max-width: 680px) { .sidebar { position: static; width: 100%; min-height: auto; padding: 17px 18px; border-right: 0; border-bottom: 1px solid var(--border); }.app-shell { display: block; }.brand-lockup { padding-bottom: 17px; }.sidebar-section-label, .sidebar-divider, .system-status, .model-status, .sidebar-footer { display: none; }.main-nav { display: flex; gap: 4px; overflow-x: auto; padding-bottom: 1px; }.nav-item { min-width: 110px; grid-template-columns: 20px 1fr; padding: 9px 8px; }.nav-arrow, .nav-badge { display: none; }.main-content { width: 100%; margin-left: 0; }.top-header { min-height: 59px; padding: 0 19px; }.breadcrumbs span, .breadcrumbs b { display: none; }.header-actions { gap: 10px; }.admin-link { padding-left: 10px; font-size: 10px; }.content-wrap { width: calc(100% - 38px); padding-top: 30px; }.page-intro { align-items: start; flex-direction: column; gap: 17px; }.page-intro h1 { font-size: 29px; }.hero-card-copy { padding: 30px 24px; }.hero-card h2 { font-size: 34px; }.stats-grid, .simulation-side, .simulation-metrics, .experiment-cards, .ablation-grid { grid-template-columns: 1fr; }.simulation-side { display: grid; }.uav-list { grid-template-columns: 1fr; }.panel { padding: 19px 17px; }.recognition-toolbar, .simulation-toolbar, .experiment-summary { align-items: start; flex-direction: column; }.simulation-toolbar { gap: 13px; }.algorithm-options { flex-wrap: wrap; }.simulation-actions { width: 100%; }.simulation-actions > * { flex: 1; justify-content: center; }.map-canvas svg { min-height: 235px; }.map-legend { gap: 7px; font-size: 7px; }.map-footer { flex-wrap: wrap; line-height: 1.5; }.task-table { overflow-x: auto; }.task-table-head, .task-row { min-width: 630px; }.result-summary { gap: 6px; }.workflow-steps { grid-template-columns: 1fr; gap: 3px; }.workflow-step { padding: 3px 0; }.workflow-step > span { width: 25px; height: 25px; }.comparison-panel { overflow-x: auto; }.comparison-table { min-width: 660px; }.footer { flex-direction: column; } }
 
+/* Image-space simulation overlay. The SVG and image share the same aspect ratio. */
+.map-canvas::before { display: none; }
+.map-canvas { aspect-ratio: 16 / 9; }
+.map-image { position: absolute; z-index: 0; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #111d2a; }
+.map-canvas svg { position: absolute; z-index: 1; inset: 0; display: block; width: 100%; height: 100%; min-height: 0; }
+.map-empty-state { position: absolute; inset: 0; z-index: 1; display: grid; place-content: center; gap: 8px; color: #9ab0ad; text-align: center; }
+.map-empty-state strong { color: #dce7df; font-size: 15px; }
+.map-empty-state span { font-size: 10px; }
+.map-image-toggle { position: absolute; z-index: 2; top: 12px; right: 12px; }
+.map-image-toggle button { padding: 6px 9px; border: 1px solid rgba(215, 232, 137, .42); border-radius: 3px; background: rgba(17, 29, 42, .78); color: var(--lime); font-size: 9px; }
+.map-image-toggle button:hover { background: rgba(17, 29, 42, .94); }
+.map-empty-hint { pointer-events: none; }
+.selection-panel { padding: 17px 16px; }
+.selection-block + .selection-block { margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--border); }
+.selection-dl { display: grid; gap: 9px; margin: 16px 0 0; }
+.selection-dl div { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 9px; }
+.selection-dl dt { color: #70838b; }
+.selection-dl dd { margin: 0; color: #dbe5df; font-family: 'DM Mono', monospace; }
+.legend-line.previous { background: rgba(215, 232, 137, .35); border-top: 1px dashed rgba(215, 232, 137, .75); }
+.legend-line.current { background: var(--teal); }
+
 /* Light workspace theme: keep analytical canvases dark for contrast, while the application chrome remains white. */
 :root {
   color: #1a2a33;
