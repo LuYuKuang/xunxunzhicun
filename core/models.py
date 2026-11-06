@@ -203,6 +203,24 @@ class Mission(models.Model):
         validators=[validate_relative_path],
         help_text='模型生成的语义分割 mask 相对路径，可以为空。',
     )
+    image_width = models.PositiveIntegerField(
+        '输入图像宽度',
+        null=True,
+        blank=True,
+        help_text='最近一次识别输入图像的像素宽度。',
+    )
+    image_height = models.PositiveIntegerField(
+        '输入图像高度',
+        null=True,
+        blank=True,
+        help_text='最近一次识别输入图像的像素高度。',
+    )
+    inference_summary = models.JSONField(
+        '识别摘要',
+        default=dict,
+        blank=True,
+        help_text='保存类别统计、平均置信度和推理元数据，供区域提取接口复用。',
+    )
     status = models.CharField(
         '任务状态',
         max_length=20,
