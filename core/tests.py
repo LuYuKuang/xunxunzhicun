@@ -93,8 +93,11 @@ class CoreApiTests(TestCase):
         )
         with override_settings(MEDIA_ROOT=self.media_root):
             response = self.client.post('/api/images/upload/', {'image': image})
+            body = response.json()['data']
+            media_response = self.client.get(f"/media/{body['image']['path']}")
         self.assertEqual(response.status_code, 201)
-        body = response.json()['data']
+        self.assertEqual(media_response.status_code, 200)
+        self.assertEqual(b''.join(media_response.streaming_content), b'fake-jpeg-content')
         self.assertEqual(body['mission']['status'], 'created')
         self.assertTrue(body['image']['path'].startswith('missions/'))
         self.assertTrue(Path(body['image']['path']).name.endswith('.jpg'))
