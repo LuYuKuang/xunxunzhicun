@@ -81,7 +81,6 @@ const navItems = [
   { id: 'overview', label: '总览', index: '01' },
   { id: 'recognition', label: '灾情识别', index: '02', badge: 'AI' },
   { id: 'simulation', label: '调度仿真', index: '03' },
-  { id: 'experiments', label: '实验对比', index: '04' },
 ]
 
 const backendMenuGroups = [
@@ -235,7 +234,6 @@ const viewMeta = {
   recognition: { eyebrow: 'VISION MODULE', title: '灾情识别', description: '上传航拍图像，提取灾情区域并生成复查任务。' },
   mission_detail: { eyebrow: 'MISSION CENTER / DETAIL', title: '任务详情', description: '查看任务状态、关联图像、任务点和仿真记录。' },
   simulation: { eyebrow: 'SWARM SIMULATION', title: '调度仿真', description: '在二维地图中观察任务分配、航线执行与动态重规划。' },
-  experiments: { eyebrow: 'BENCHMARK LAB', title: '实验对比', description: '用统一任务和随机种子比较不同调度策略。' },
 }
 
 const tasks = ref([])
@@ -247,19 +245,7 @@ const defaultUavs = [
 ]
 const uavs = ref(cloneUavs(defaultUavs))
 
-const recognitionClasses = ref([
-  { label: '受淹建筑', value: 28, confidence: '96.2%', color: '#ef8d73' },
-  { label: '受淹道路', value: 41, confidence: '91.4%', color: '#e4bc70' },
-  { label: '水体区域', value: 19, confidence: '87.8%', color: '#78d5c5' },
-  { label: '未受影响', value: 12, confidence: '98.1%', color: '#6c768d' },
-])
-
-const experiments = [
-  { method: '平均分配', tag: 'BASELINE', completion: 68, time: '18:42', distance: '4.86 km', recovery: '—', tone: 'muted' },
-  { method: '最近任务优先', tag: 'GREEDY', completion: 76, time: '16:20', distance: '4.21 km', recovery: '62%', tone: 'blue' },
-  { method: '标准离散 PSO', tag: 'PSO', completion: 86, time: '13:58', distance: '3.64 km', recovery: '78%', tone: 'purple' },
-  { method: '风险加权 PSO', tag: 'PROPOSED', completion: 94, time: '11:26', distance: '3.18 km', recovery: '93%', tone: 'lime' },
-]
+const recognitionClasses = ref([])
 
 const eventLog = ref([
   { time: '刚刚', title: '等待真实识别结果', detail: '上传航拍图后提取受淹区域', tone: 'teal' },
@@ -287,6 +273,13 @@ const stats = computed(() => [
   { label: '重点任务完成率', value: plannerCompletionLabel.value, delta: simulationPlan.value ? `${simulationPlan.value.algorithm} 实时计划` : '等待调度', icon: '↗', tone: 'purple' },
   { label: '预计总航程', value: plannerDistanceLabel.value, delta: simulationPlan.value ? '来自当前计划' : '等待调度', icon: '⌁', tone: 'lime' },
 ])
+
+const missionProgressPercent = computed(() => {
+  const total = missionTaskPoints.value.length
+  if (!total) return missionRows.value[0]?.status === 'completed' ? 100 : 0
+  const done = missionTaskPoints.value.filter((point) => point.status === 'completed').length
+  return Math.round((done / total) * 100)
+})
 
 function cloneUavs(source) {
   return source.map((uav) => ({ ...uav, route: uav.route.map((point) => [...point]) }))
@@ -943,18 +936,6 @@ function resetSimulation() {
   eventLog.value = [{ time: '刚刚', title: '等待真实任务', detail: tasks.value.length ? `${tasks.value.length} 个区域 · ${uavs.value.length} 架虚拟无人机` : '上传并识别航拍图像后开始', tone: 'teal' }]
 }
 
-function downloadReport() {
-  const header = 'method,completion_rate,total_time,total_distance,recovery_rate\n'
-  const rows = experiments.map((item) => `${item.method},${item.completion}%,${item.time},${item.distance},${item.recovery}`).join('\n')
-  const blob = new Blob([`\ufeff${header}${rows}`], { type: 'text/csv;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const link = document.createElement('a')
-  link.href = url
-  link.download = 'xunxunzhicun-experiment-report.csv'
-  link.click()
-  URL.revokeObjectURL(url)
-}
-
 onUnmounted(() => {
   clearInterval(simulationTimer.value)
   if (animationFrame.value) cancelAnimationFrame(animationFrame.value)
@@ -982,7 +963,7 @@ onMounted(() => {
 
       <div class="sidebar-section-label">工作台 / WORKSPACE</div>
       <nav class="main-nav" aria-label="主导航">
-        <button v-for="item in navItems" :key="item.id" class="nav-item" :class="{ active: activeView === item.id }" @click="openView(item.id)">
+        <button v-for="item in navItems" :key="item.id" class="nav-item" :class="{ active: activeView === item.id }" :aria-current="activeView === item.id ? 'page' : undefined" @click="openView(item.id)">
           <span class="nav-index">{{ item.index }}</span>
           <span class="nav-label">{{ item.label }}</span>
           <span v-if="item.badge" class="nav-badge">{{ item.badge }}</span>
@@ -991,7 +972,7 @@ onMounted(() => {
       </nav>
 
       <div class="backend-nav">
-        <button class="backend-nav-title" :class="{ active: isDataView }" @click="dataMenuOpen = !dataMenuOpen">
+        <button class="backend-nav-title" :class="{ active: isDataView }" :aria-expanded="dataMenuOpen" @click="dataMenuOpen = !dataMenuOpen">
           <span class="nav-index">DB</span><span>数据后台</span><span class="backend-chevron">{{ dataMenuOpen ? '⌃' : '⌄' }}</span>
         </button>
         <div v-show="dataMenuOpen" class="backend-groups">
@@ -1026,8 +1007,7 @@ onMounted(() => {
       <header class="top-header">
         <div class="breadcrumbs"><span>汛巡智群</span><b>/</b><strong>{{ currentMeta.title }}</strong></div>
         <div class="header-actions">
-          <div class="live-pill"><span></span> LIVE DEMO</div>
-          <button class="icon-button" title="帮助">?</button>
+          <div class="live-pill" :class="{ 'connection-error': healthStatus?.status === 'error' }"><span></span>{{ healthLoading || !healthStatus ? '检查连接中' : healthStatus.status === 'error' ? '服务未连接' : '服务已连接' }}</div>
           <a class="admin-link" href="/admin/">管理后台 <span>↗</span></a>
         </div>
       </header>
@@ -1039,7 +1019,6 @@ onMounted(() => {
             <h1>{{ currentMeta.title }}</h1>
             <p>{{ currentMeta.description }}</p>
           </div>
-          <button class="outline-button" @click="downloadReport">导出实验报告 <span>↓</span></button>
         </section>
 
         <section v-if="activeView === 'overview'" class="view-stack">
@@ -1051,11 +1030,8 @@ onMounted(() => {
               <button class="solid-button" @click="openView('recognition')">开始一次识别 <span>→</span></button>
             </div>
             <div class="hero-visual" aria-hidden="true">
-              <div class="visual-grid"></div>
-              <div class="radar-ring ring-a"></div><div class="radar-ring ring-b"></div><div class="radar-ring ring-c"></div>
-              <div class="radar-sweep"></div>
-              <span class="radar-dot dot-a"></span><span class="radar-dot dot-b"></span><span class="radar-dot dot-c"></span>
-              <span class="visual-caption">MULTI-UAV / 03</span>
+              <div class="scene-frame"><span></span><span></span><span></span><span></span></div>
+              <div class="scene-caption"><span>FIELD VIEW / 场景示意</span><strong>从感知到行动</strong><small>航拍识别 · 任务提取 · 协同调度</small></div>
             </div>
           </div>
 
@@ -1073,8 +1049,8 @@ onMounted(() => {
               <div v-if="missionLoading" class="table-state home-inline-state"><span class="loading-ring"></span><strong>正在读取最近任务…</strong></div>
               <div v-else-if="missionError" class="table-state table-error home-inline-state"><span>!</span><strong>{{ missionError }}</strong><button class="text-button" @click="loadMissionList">重试 <span>↻</span></button></div>
               <button v-else-if="missionRows.length" class="mission-summary mission-summary-button" @click="openMissionDetail(missionRows[0].id)">
-                <div class="mission-map mini-map"><span class="mini-route route-one"></span><span class="mini-route route-two"></span><i class="mini-point p-one"></i><i class="mini-point p-two"></i><i class="mini-point p-three"></i></div>
-                <div class="mission-info"><div class="mission-title"><strong>{{ missionRows[0].name }}</strong><span class="success-tag">{{ missionRows[0].status_label || missionRows[0].status }}</span></div><p>{{ missionRows[0].input_image_path || '尚未关联航拍图像' }}</p><div class="progress-track"><span :style="{ width: missionRows[0].status === 'completed' ? '100%' : '42%' }"></span></div><div class="mission-foot"><span>{{ missionTaskPoints.length || '—' }} 个任务点</span><span>Mission #{{ missionRows[0].id }}</span><span>点击查看详情</span></div></div>
+                
+                <div class="mission-info"><div class="mission-title"><strong>{{ missionRows[0].name }}</strong><span class="success-tag">{{ missionRows[0].status_label || missionRows[0].status }}</span></div><p>{{ missionRows[0].input_image_path || '尚未关联航拍图像' }}</p><div class="progress-track"><span :style="{ width: `${missionProgressPercent}%` }"></span></div><div class="mission-foot"><span>{{ missionTaskPoints.length || '—' }} 个任务点</span><span>Mission #{{ missionRows[0].id }}</span><span>点击查看详情</span></div></div>
               </button>
               <div v-else class="table-state home-inline-state"><span>∅</span><strong>暂无任务记录</strong><button class="text-button" @click="openView('recognition')">上传图片创建任务 <span>→</span></button></div>
             </article>
@@ -1141,10 +1117,10 @@ onMounted(() => {
             <article class="panel upload-panel">
               <div class="panel-heading"><div><span class="panel-kicker">01 / INPUT</span><h2>导入航拍图像</h2></div><span class="file-type">JPG / PNG</span></div>
               <input ref="fileInput" class="visually-hidden" type="file" accept="image/*" @change="handleFile" />
-              <div class="drop-zone" :class="{ 'has-file': uploadedName }" @click="openFilePicker" @dragover.prevent @drop.prevent="handleDrop">
+              <div class="drop-zone" :class="{ 'has-file': uploadedName }" role="button" tabindex="0" aria-label="选择航拍图像" @click="openFilePicker" @keydown.enter.prevent="openFilePicker" @keydown.space.prevent="openFilePicker" @dragover.prevent @drop.prevent="handleDrop">
                 <template v-if="imagePreview"><img :src="imagePreview" alt="已上传的航拍图像" /></template>
                 <template v-else>
-                  <div class="aerial-preview"><svg viewBox="0 0 520 300" role="img" aria-label="航拍样例图"><defs><pattern id="fieldGrid" width="34" height="34" patternUnits="userSpaceOnUse"><rect width="34" height="34" fill="#1e2a39"/><path d="M 34 0 L 0 0 0 34" fill="none" stroke="#324558" stroke-width="1"/></pattern></defs><rect width="520" height="300" fill="url(#fieldGrid)"/><path d="M0 212 C90 175 118 232 196 192 S324 162 402 194 S470 202 520 168 V300 H0Z" fill="#224d55" opacity=".8"/><path d="M86 0 L130 300 M286 0 L260 300 M438 0 L392 300" stroke="#7d8e73" stroke-width="18" opacity=".45"/><path d="M86 0 L130 300 M286 0 L260 300 M438 0 L392 300" stroke="#d1c68d" stroke-width="2" stroke-dasharray="7 9" opacity=".8"/><path d="M210 40 L380 58 L368 148 L205 131Z M80 60 L180 72 L170 138 L70 126Z M308 214 L465 230 L454 280 L300 266Z" fill="#db826b" opacity=".65"/><circle cx="140" cy="104" r="32" fill="none" stroke="#f2c879" stroke-width="2" stroke-dasharray="5 5"/><circle cx="350" cy="104" r="38" fill="none" stroke="#78d5c5" stroke-width="2" stroke-dasharray="5 5"/></svg><div class="preview-overlay"><span>FLOODNET / SAMPLE</span><b>512 × 512</b></div></div>
+                  <div class="aerial-preview" aria-hidden="true"><div class="preview-overlay"><span>航拍图像 / IMAGE INPUT</span><b>场景示意</b></div></div>
                   <div class="drop-copy"><strong>{{ uploadedName || '拖拽航拍图像到这里' }}</strong><small>{{ uploadedName ? '点击更换图像' : '或点击选择本地文件' }}</small></div>
                 </template>
               </div>
@@ -1156,8 +1132,9 @@ onMounted(() => {
 
             <article class="panel result-panel">
               <div class="panel-heading"><div><span class="panel-kicker">02 / OUTPUT</span><h2>识别结果</h2></div><span class="model-chip">FloodNet · 10 类分割</span></div>
-              <div class="result-preview"><template v-if="recognitionResult?.mask_url"><img class="model-mask-preview" :src="showMask ? recognitionResult.mask_url : imagePreview" alt="模型生成的语义分割 mask" /></template><svg v-else viewBox="0 0 640 280" role="img" aria-label="识别结果预览"><defs><pattern id="resultGrid" width="32" height="32" patternUnits="userSpaceOnUse"><rect width="32" height="32" fill="#172333"/><path d="M 32 0 L 0 0 0 32" fill="none" stroke="#2c4152" stroke-width="1"/></pattern></defs><rect width="640" height="280" fill="url(#resultGrid)"/><path d="M0 205 C100 170 172 234 265 185 S426 163 520 206 S590 192 640 178 V280 H0Z" fill="#1d4b54"/><path d="M80 18 L126 280 M350 0 L312 280 M544 0 L488 280" stroke="#83916f" stroke-width="22" opacity=".4"/><path d="M80 18 L126 280 M350 0 L312 280 M544 0 L488 280" stroke="#d3ca94" stroke-width="2" stroke-dasharray="8 10"/><g v-if="showMask" opacity=".88"><path d="M168 32 L325 48 L308 126 L164 113Z" fill="#ee8f76"/><path d="M354 171 L506 188 L493 251 L340 240Z" fill="#e4bc70"/><path d="M54 170 L138 150 L163 214 L72 234Z" fill="#78d5c5"/></g><g v-if="recognitionReady" class="result-markers"><circle cx="245" cy="84" r="6" fill="#fff"/><circle cx="430" cy="214" r="6" fill="#fff"/><circle cx="102" cy="192" r="6" fill="#fff"/></g></svg><div v-if="!recognitionReady" class="result-empty"><span>◎</span><strong>等待识别输入</strong><small>选择一张航拍图，查看模型输出</small></div><div v-else class="result-overlay"><span>MASK OUTPUT</span><button @click="showMask = !showMask">{{ showMask ? '隐藏分割' : '显示分割' }}</button></div></div>
-              <div class="classification-list"><div v-for="item in recognitionClasses" :key="item.label" class="classification-row"><span class="class-dot" :style="{ background: item.color }"></span><strong>{{ item.label }}</strong><div class="class-bar"><span :style="{ width: `${item.value * 2.1}%`, background: item.color }"></span></div><b>{{ recognitionReady ? item.confidence : '—' }}</b></div></div>
+              <div class="result-preview"><template v-if="recognitionResult?.mask_url"><img class="model-mask-preview" :src="showMask ? recognitionResult.mask_url : imagePreview" alt="模型生成的语义分割 mask" /></template><div v-else class="result-blank" aria-hidden="true"><div class="result-scan-icon"><span></span></div></div><div v-if="!recognitionReady" class="result-empty"><span>◎</span><strong>等待识别输入</strong><small>选择一张航拍图，查看模型输出</small></div><div v-else class="result-overlay"><span>MASK OUTPUT</span><button @click="showMask = !showMask">{{ showMask ? '隐藏分割' : '显示分割' }}</button></div></div>
+              <div v-if="recognitionClasses.length" class="classification-list"><div v-for="item in recognitionClasses" :key="item.label" class="classification-row"><span class="class-dot" :style="{ background: item.color }"></span><strong>{{ item.label }}</strong><div class="class-bar"><span :style="{ width: `${item.value * 2.1}%`, background: item.color }"></span></div><b>{{ recognitionReady ? item.confidence : '—' }}</b></div></div>
+              <div v-else class="table-state compact-state"><span>∅</span><strong>尚未识别</strong><small>上传图片后显示各类别像素占比</small></div>
               <div class="result-summary"><div><span>淹水像素占比</span><strong>{{ recognitionReady ? (Number(recognitionResult?.flood_ratio || 0) * 100).toFixed(1) : '—' }}<small>%</small></strong></div><div><span>平均置信度</span><strong>{{ recognitionReady ? (Number(recognitionResult?.mean_confidence || 0) * 100).toFixed(1) : '—' }}<small>%</small></strong></div><div><span>推理耗时</span><strong>{{ recognitionReady ? (Number(recognitionResult?.inference_ms || 0) / 1000).toFixed(2) : '—' }}<small>s</small></strong></div></div>
             </article>
           </div>
@@ -1211,13 +1188,6 @@ onMounted(() => {
   </article><article class="panel uav-panel"><div class="panel-heading"><div><span class="panel-kicker">FLEET STATUS</span><h2>机队状态</h2></div><span class="count-label">{{ uavs.length }} AIRCRAFT</span></div><div class="uav-list"><div v-for="uav in uavs" :key="uav.id" class="uav-card" :class="{ failed: uav.status === '故障退出' }"><div class="uav-card-top"><span class="uav-color" :style="{ background: uav.color }"></span><div><strong>{{ uav.id }}</strong><small>{{ uav.name }}</small></div><span class="uav-state">{{ uav.status }}</span></div><div class="battery-row"><span>电量</span><div class="battery-track"><i :style="{ width: `${uav.battery}%`, background: uav.color }"></i></div><b>{{ uav.battery }}%</b></div><div class="uav-meta"><span>分配任务 <b>{{ uav.assigned }}</b></span><span>返航余量 <b>{{ Math.max(10, uav.battery - 18) }}%</b></span></div></div></div></article><article class="panel event-panel simulation-events"><div class="panel-heading"><div><span class="panel-kicker">EVENT INJECTION</span><h2>事件模拟</h2></div><span class="event-help">用于演示</span></div><div class="event-buttons"><button @click="triggerEvent('故障')"><span class="event-button-icon danger">×</span><div><strong>UAV-02 故障</strong><small>模拟退出并重规划</small></div><span>→</span></button><button @click="triggerEvent('新增')"><span class="event-button-icon add">＋</span><div><strong>新增复查任务</strong><small>生成增量航线</small></div><span>→</span></button></div></article></aside>
           </div>
           <div class="simulation-metrics"><article class="metric-card"><span>仿真进度</span><strong>{{ progressLabel }}</strong><div class="metric-progress"><i :style="{ width: `${simulationProgress}%` }"></i></div></article><article class="metric-card"><span>重点任务完成率</span><strong>{{ plannerCompletionLabel }}</strong><em>{{ simulationPlan ? '当前计划' : '等待计划' }}</em></article><article class="metric-card"><span>已规划总航程</span><strong>{{ plannerDistanceLabel }}</strong><em>{{ simulationPlan ? '二维仿真距离' : '等待计划' }}</em></article><article class="metric-card"><span>预计完成时间</span><strong>{{ plannerTimeLabel }}</strong><em>{{ simulationPlan ? '当前计划 makespan' : '等待计划' }}</em></article></div>
-        </section>
-
-        <section v-else-if="activeView === 'experiments'" class="view-stack">
-          <div class="experiment-summary"><div><span class="panel-kicker">CONTROLLED EXPERIMENT</span><h2>同一任务，不同策略</h2><p>所有方案使用相同任务点、初始电量和故障事件，比较调度算法在效率与恢复能力上的差异。</p></div><button class="solid-button" @click="downloadReport">下载 CSV 报告 <span>↓</span></button></div>
-          <div class="experiment-cards"><article v-for="item in experiments" :key="item.method" class="experiment-card" :class="`experiment-${item.tone}`"><div class="experiment-card-top"><span>{{ item.tag }}</span><i v-if="item.tone === 'lime'">PROPOSED</i></div><strong>{{ item.completion }}<small>%</small></strong><span>重点任务完成率</span><div class="experiment-bar"><i :style="{ width: `${item.completion}%` }"></i></div><p>{{ item.method }}</p></article></div>
-          <article class="panel comparison-panel"><div class="panel-heading"><div><span class="panel-kicker">BENCHMARK TABLE</span><h2>调度结果对比</h2></div><span class="table-note">同一仿真场景 / N = 30</span></div><div class="comparison-table"><div class="comparison-head"><span>方法</span><span>重点任务完成率</span><span>总完成时间</span><span>总航程</span><span>故障恢复率</span></div><div v-for="item in experiments" :key="`${item.method}-row`" class="comparison-row"><span><i :class="`method-dot ${item.tone}`"></i><strong>{{ item.method }}</strong><small>{{ item.tag }}</small></span><span><b>{{ item.completion }}%</b><div class="table-bar"><i :class="item.tone" :style="{ width: `${item.completion}%` }"></i></div></span><span>{{ item.time }}</span><span>{{ item.distance }}</span><span :class="{ 'highlight-value': item.tone === 'lime' }">{{ item.recovery }}</span></div></div></article>
-          <div class="ablation-grid"><article class="panel ablation-card"><div class="panel-heading"><div><span class="panel-kicker">ABLATION 01</span><h2>移除不确定性评分</h2></div><span class="loss-tag">−12.4%</span></div><p>没有识别置信度作为优先级因素时，高风险区域的发现顺序变慢。</p><div class="ablation-chart"><span style="height: 48%"></span><span style="height: 64%"></span><span style="height: 56%"></span><span style="height: 76%"></span><span style="height: 68%"></span><span style="height: 84%"></span></div><div class="chart-labels"><span>完成时间</span><span>高优任务率</span><span>恢复率</span></div></article><article class="panel ablation-card"><div class="panel-heading"><div><span class="panel-kicker">ABLATION 02</span><h2>移除动态重调度</h2></div><span class="loss-tag">−18.7%</span></div><p>故障发生后保留静态分配，会造成剩余无人机闲置和任务延误。</p><div class="ablation-chart purple-chart"><span style="height: 70%"></span><span style="height: 42%"></span><span style="height: 61%"></span><span style="height: 34%"></span><span style="height: 51%"></span><span style="height: 27%"></span></div><div class="chart-labels"><span>完成时间</span><span>高优任务率</span><span>恢复率</span></div></article></div>
         </section>
 
         <section v-else-if="activeView === 'task_points'" class="view-stack">
