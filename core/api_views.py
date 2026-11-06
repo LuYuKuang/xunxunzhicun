@@ -5,6 +5,7 @@
 
 import importlib.util
 import json
+import mimetypes
 import uuid
 from functools import wraps
 from pathlib import Path
@@ -16,7 +17,7 @@ from django.core.files.storage import default_storage
 from django.db import IntegrityError, connection
 from django.db.models import Count
 from django.db.utils import DatabaseError
-from django.http import JsonResponse
+from django.http import FileResponse, Http404, JsonResponse
 from django.middleware.csrf import get_token
 from django.utils import timezone
 from django.views.decorators.csrf import ensure_csrf_cookie
@@ -177,6 +178,22 @@ def _image_response(path):
         'path': path,
         'url': default_storage.url(path),
     }
+
+
+@require_GET
+def media_file(request, path):
+    """从 Django 当前配置的文件存储中返回上传图像或 mask。"""
+    normalized = Path(path).as_posix()
+    if normalized.startswith('/') or any(part == '..' for part in Path(normalized).parts):
+        raise Http404
+    if not default_storage.exists(normalized):
+        raise Http404
+    try:
+        file_handle = default_storage.open(normalized, 'rb')
+    except OSError as exc:
+        raise Http404 from exc
+    content_type = mimetypes.guess_type(normalized)[0] or 'application/octet-stream'
+    return FileResponse(file_handle, content_type=content_type)
 
 
 def _model_health():
