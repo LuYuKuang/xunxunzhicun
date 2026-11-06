@@ -117,6 +117,36 @@ export async function previewPlan(payload) {
   return parseResponse(response, '调度计划计算失败')
 }
 
+/** 从一次 Mission 的 mask 提取真实区域并生成任务点和首轮计划。 */
+export async function dispatchMission(missionId, payload = {}) {
+  await ensureCsrf()
+  const response = await fetch(`${API_BASE}/missions/${encodeURIComponent(missionId)}/dispatch/`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      ...(csrfCookie() ? { 'X-CSRFToken': csrfCookie() } : {}),
+    },
+    body: JSON.stringify(payload),
+  })
+  return parseResponse(response, '任务区域生成失败')
+}
+
+/** 将手动或外部补充的区域转换为 TaskPoint。 */
+export async function generateTaskPoints(payload) {
+  await ensureCsrf()
+  const response = await fetch(`${API_BASE}/tasks/generate/`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      ...(csrfCookie() ? { 'X-CSRFToken': csrfCookie() } : {}),
+    },
+    body: JSON.stringify(payload),
+  })
+  return parseResponse(response, '任务点生成失败')
+}
+
 /** 更新仿真状态和汇总指标。后端使用 query string 传递仿真 ID。 */
 export async function updateSimulationRun(simulationId, payload) {
   await ensureCsrf()
