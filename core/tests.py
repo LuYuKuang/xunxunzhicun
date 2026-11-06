@@ -5,6 +5,7 @@ from pathlib import Path
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.conf import settings
 from django.test import TestCase, override_settings
+from PIL import Image
 
 from .models import Dataset, Mission, SimulationRun, TaskPoint
 
@@ -136,6 +137,206 @@ class CoreApiTests(TestCase):
         self.assertEqual(update_response.status_code, 200)
         self.assertEqual(update_response.json()['data']['status'], 'completed')
         self.assertIsNotNone(SimulationRun.objects.get(pk=run_id).finished_at)
+
+
+class RegionApiTests(CoreApiTests):
+    """验证 palette mask 的缩放、连通域和空区域响应。"""
+
+    def _write_mask(self, name, pixels):
+        path = self.media_root / 'missions' / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mask = Image.new('P', (20, 10), 0)
+        mask.putpalette([value for index in range(256) for value in (index, index, index)])
+        data = mask.load()
+        for (x, y), class_id in pixels.items():
+            data[x, y] = class_id
+        mask.save(path)
+        return f'missions/{name}'
+
+    def test_regions_keep_pixel_bounds_and_categories(self):
+        pixels = {(x, y): 1 for x in range(3, 8) for y in range(2, 6)}
+        pixels.update({(x, y): 3 for x in range(14, 19) for y in range(7, 9)})
+        mission = Mission.objects.create(
+            name='区域提取测试',
+            input_image_path='missions/input.png',
+            mask_path=self._write_mask('regions.png', pixels),
+            image_width=20,
+            image_height=10,
+            inference_summary={
+                'class_stats': [
+                    {'id': 1, 'confidence': 0.91},
+                    {'id': 3, 'confidence': 0.83},
+                ],
+                'mean_confidence': 0.8,
+            },
+        )
+        with override_settings(MEDIA_ROOT=self.media_root):
+            response = self.client.post(
+                f'/api/missions/{mission.pk}/regions/',
+                data=json.dumps({'min_area_px': 1, 'max_regions': 12}),
+                content_type='application/json',
+            )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()['data']
+        self.assertEqual((body['width'], body['height']), (20, 10))
+        self.assertEqual(len(body['regions']), 2)
+        self.assertEqual({item['category'] for item in body['regions']}, {'flooded_building', 'flooded_road'})
+        for item in body['regions']:
+            self.assertGreaterEqual(item['x'], 0)
+            self.assertLessEqual(item['x'], 20)
+            self.assertGreaterEqual(item['y'], 0)
+            self.assertLessEqual(item['y'], 10)
+            x1, y1, x2, y2 = item['bbox']
+            self.assertGreaterEqual(x1, 0)
+            self.assertGreaterEqual(y1, 0)
+            self.assertLessEqual(x2, 20)
+            self.assertLessEqual(y2, 10)
+            self.assertLessEqual(x1, x2)
+            self.assertLessEqual(y1, y2)
+
+    def test_empty_mask_returns_note_without_error(self):
+        mission = Mission.objects.create(
+            name='空区域测试',
+            input_image_path='missions/input.png',
+            mask_path=self._write_mask('empty.png', {}),
+            image_width=20,
+            image_height=10,
+        )
+        with override_settings(MEDIA_ROOT=self.media_root):
+            response = self.client.post(
+                f'/api/missions/{mission.pk}/regions/',
+                data=json.dumps({}),
+                content_type='application/json',
+            )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()['data']
+        self.assertEqual(body['regions'], [])
+        self.assertEqual(body['note'], '未检出受淹区域')
+
+    def test_large_4000_by_3000_mask_uses_image_coordinates(self):
+        path = self.media_root / 'missions' / 'large.png'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mask = Image.new('P', (4000, 3000), 0)
+        mask.putpalette([value for index in range(256) for value in (index, index, index)])
+        data = mask.load()
+        for x in range(1000, 1800):
+            for y in range(600, 1200):
+                data[x, y] = 1
+        mask.save(path)
+        mission = Mission.objects.create(
+            name='大图区域测试',
+            input_image_path='missions/input.png',
+            mask_path='missions/large.png',
+            image_width=4000,
+            image_height=3000,
+            inference_summary={'class_stats': [{'id': 1, 'confidence': 0.88}]},
+        )
+        with override_settings(MEDIA_ROOT=self.media_root):
+            response = self.client.post(
+                f'/api/missions/{mission.pk}/regions/',
+                data=json.dumps({'min_area_px': 2000, 'max_regions': 12}),
+                content_type='application/json',
+            )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()['data']
+        self.assertEqual((body['width'], body['height']), (4000, 3000))
+        self.assertEqual(len(body['regions']), 1)
+        region = body['regions'][0]
+        self.assertTrue(0 <= region['x'] <= 4000)
+        self.assertTrue(0 <= region['y'] <= 3000)
+        self.assertTrue(0 <= region['bbox'][0] <= region['bbox'][2] <= 4000)
+        self.assertTrue(0 <= region['bbox'][1] <= region['bbox'][3] <= 3000)
+
+
+class DispatchApiTests(RegionApiTests):
+    """验证区域到任务点再到 planner 的完整编排和坐标还原。"""
+
+    def test_dispatch_creates_tasks_and_restores_pixel_routes(self):
+        pixels = {(x, y): 1 for x in range(3, 8) for y in range(2, 6)}
+        pixels.update({(x, y): 3 for x in range(14, 19) for y in range(7, 9)})
+        mission = Mission.objects.create(
+            name='编排测试',
+            input_image_path='missions/input.png',
+            mask_path=self._write_mask('dispatch.png', pixels),
+            image_width=20,
+            image_height=10,
+            inference_summary={'class_stats': [{'id': 1, 'confidence': 0.9}, {'id': 3, 'confidence': 0.8}]},
+        )
+        payload = {
+            'min_area_px': 1,
+            'max_regions': 12,
+            'coordinate_scale': 0.1,
+            'algorithm': 'round_robin',
+            'uav_configuration': [{
+                'id': 'UAV-01',
+                'x': 10,
+                'y': 9,
+                'home': {'x': 10, 'y': 9},
+                'battery_level': 100,
+                'status': 'idle',
+            }],
+            'map_state': {'width': 20, 'height': 10, 'home': {'x': 10, 'y': 9}},
+        }
+        with override_settings(MEDIA_ROOT=self.media_root):
+            response = self.client.post(
+                f'/api/missions/{mission.pk}/dispatch/',
+                data=json.dumps(payload),
+                content_type='application/json',
+            )
+        self.assertEqual(response.status_code, 201)
+        body = response.json()['data']
+        self.assertEqual(len(body['regions']), 2)
+        self.assertEqual(len(body['tasks']), 2)
+        self.assertIsNotNone(body['plan'])
+        self.assertEqual(body['plan']['config']['coordinate_scale'], 0.1)
+        for route in body['plan']['routes'].values():
+            for point in [route['start'], route['return'], *(route['tasks'] or [])]:
+                if point:
+                    self.assertGreaterEqual(point['x'], 0)
+                    self.assertLessEqual(point['x'], 20)
+                    self.assertGreaterEqual(point['y'], 0)
+                    self.assertLessEqual(point['y'], 10)
+        self.assertEqual(TaskPoint.objects.filter(mission=mission).count(), 2)
+
+    def test_replan_restores_pixel_routes_after_failure(self):
+        mission = Mission.objects.create(
+            name='重规划测试',
+            input_image_path='missions/input.png',
+            image_width=100,
+            image_height=60,
+        )
+        run = SimulationRun.objects.create(
+            mission=mission,
+            planning_method='risk_aware_pso',
+            status=SimulationRun.Status.RUNNING,
+            uav_configuration=[
+                {'id': 'UAV-01', 'x': 50, 'y': 55, 'battery_level': 90, 'status': 'idle'},
+                {'id': 'UAV-02', 'x': 58, 'y': 55, 'battery_level': 90, 'status': 'idle'},
+            ],
+            task_snapshot=[
+                {'id': 'T-1', 'x': 20, 'y': 20, 'category': 'flooded_building', 'area': 20, 'confidence': 0.8, 'priority': 20, 'status': 'pending'},
+                {'id': 'T-2', 'x': 80, 'y': 25, 'category': 'flooded_road', 'area': 20, 'confidence': 0.8, 'priority': 20, 'status': 'pending'},
+            ],
+            summary_metrics={
+                'map_state': {'width': 100, 'height': 60, 'home': {'x': 50, 'y': 55}},
+                'coordinate_scale': 0.1,
+                'routes': {},
+            },
+        )
+        response = self.client.post(
+            f'/api/simulation-runs/{run.pk}/replan/',
+            data=json.dumps({'event_type': 'uav_failure', 'uav_id': 'UAV-02'}),
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 200)
+        plan = response.json()['data']
+        self.assertEqual(plan['config']['coordinate_scale'], 0.1)
+        self.assertNotIn('UAV-02', plan['assignments'])
+        for route in plan['routes'].values():
+            self.assertGreaterEqual(route['start']['x'], 0)
+            self.assertLessEqual(route['start']['x'], 100)
+            self.assertGreaterEqual(route['start']['y'], 0)
+            self.assertLessEqual(route['start']['y'], 60)
 
 # Create your tests here.
 
