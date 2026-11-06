@@ -22,12 +22,15 @@ from django.urls import include, path
 from django.conf.urls.static import static
 from django.views.generic import RedirectView
 
+from core import api_views
+
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://127.0.0.1:5173/')
 
 urlpatterns = [
     path('', RedirectView.as_view(url=FRONTEND_URL, permanent=False)),
     path('admin/', admin.site.urls),
     path('api/', include('core.urls', namespace='core-api')),
+    path('media/<path:path>', api_views.media_file, name='media-file'),
 ]
 
 # Railway 使用持久化卷保存上传图片；通过 Django 提供媒体文件，供前端反向代理访问。
