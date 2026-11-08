@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from math import isfinite
+
 from planner.registry import plan as run_plan
 from planner.registry import replan as run_replan
 
-from .models import SimulationEvent, SimulationRun, TaskPoint, UAV
+from .models import SimulationRun, TaskPoint, UAV
 
 
 PIXEL_TO_VIRTUAL_M = 0.1
@@ -39,9 +41,10 @@ def _scale_uavs(uavs, scale):
         home = value.get('home')
         if isinstance(home, dict):
             value['home'] = _scale_xy(home, scale)
-        elif 'home_x' in value or 'home_y' in value:
-            value['home_x'] = float(value.get('home_x', 0)) * scale
-            value['home_y'] = float(value.get('home_y', 0)) * scale
+        else:
+            for axis in ('home_x', 'home_y'):
+                if value.get(axis) is not None:
+                    value[axis] = float(value[axis]) * scale
         result.append(value)
     return result
 
@@ -173,24 +176,98 @@ def preview(payload, mission_id=None):
     return _restore_result(result, scale)
 
 
+def _snapshot_id(value, field):
+    if isinstance(value, bool) or not isinstance(value, (str, int)) or not str(value).strip():
+        raise ValueError(f'{field} 必须是有效的编号。')
+    return str(value)
+
+
+def _snapshot_number(value, field, maximum=None):
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'{field} 必须是有限的非负数。') from None
+    if isinstance(value, bool) or not isfinite(number) or number < 0:
+        raise ValueError(f'{field} 必须是有限的非负数。')
+    if maximum is not None and number > maximum:
+        raise ValueError(f'{field} 超出允许范围。')
+    return number
+
+
+def simulation_snapshot(run):
+    summary = run.summary_metrics or {}
+    return {
+        'tasks': [dict(item) for item in run.task_snapshot or []],
+        'uavs': [dict(item) for item in run.uav_configuration or []],
+        'map_state': summary.get('map_state') or {},
+        'routes': summary.get('routes') or {},
+    }
+
+
+def merge_current_state(state, current_state):
+    """把客户端可更新的飞行状态合并到服务端的仿真快照。"""
+    if not isinstance(current_state, dict):
+        raise ValueError('current_state 必须是对象。')
+    telemetry = current_state.get('uavs', [])
+    completed_ids = current_state.get('completed_task_ids', [])
+    if not isinstance(telemetry, list) or not isinstance(completed_ids, list):
+        raise ValueError('current_state.uavs 和 completed_task_ids 必须是数组。')
+    known_uavs = {str(item.get('id', item.get('identifier'))): item for item in state['uavs']}
+    known_tasks = {str(item.get('id', item.get('task_id'))): item for item in state['tasks']}
+    bounds = state['map_state']
+    seen = set()
+    for item in telemetry:
+        if not isinstance(item, dict):
+            raise ValueError('current_state.uavs 每项必须是对象。')
+        uav_id = _snapshot_id(item.get('id'), 'current_state.uavs.id')
+        if uav_id not in known_uavs or uav_id in seen:
+            raise ValueError(f'当前仿真的无人机编号不存在或重复：{uav_id}。')
+        seen.add(uav_id)
+        uav = known_uavs[uav_id]
+        for axis, dimension in (('x', 'width'), ('y', 'height')):
+            limit = bounds.get(dimension)
+            limit = _snapshot_number(limit, dimension) if limit is not None else None
+            uav[axis] = _snapshot_number(item.get(axis), f'{uav_id}.{axis}', limit)
+            # 旧运行可能用 position_x/y 保存坐标，更新时同步其别名。
+            if f'position_{axis}' in uav:
+                uav[f'position_{axis}'] = uav[axis]
+        battery = _snapshot_number(item.get('battery_level'), f'{uav_id}.battery_level', 100)
+        previous_battery = uav.get('battery_level', uav.get('battery'))
+        if previous_battery is not None and battery > float(previous_battery) + 1e-6:
+            raise ValueError(f'{uav_id} 的电量不能高于已保存的飞行状态。')
+        uav['battery_level'] = battery
+    for raw_id in completed_ids:
+        task_id = _snapshot_id(raw_id, 'completed_task_ids')
+        if task_id not in known_tasks:
+            raise ValueError(f'当前仿真的任务编号不存在：{task_id}。')
+        if known_tasks[task_id].get('status') != 'cancelled':
+            known_tasks[task_id]['status'] = 'completed'
+
+
 def replan_simulation(simulation_run: SimulationRun, event_payload=None, config=None):
     event_payload = dict(event_payload or {})
-    before = {
-        'tasks': simulation_run.task_snapshot or [],
-        'uavs': simulation_run.uav_configuration or [],
-        'map_state': (simulation_run.summary_metrics or {}).get('map_state', {}),
-        'routes': (simulation_run.summary_metrics or {}).get('routes', {}),
-    }
+    summary_before = simulation_run.summary_metrics or {}
+    before = simulation_snapshot(simulation_run)
+    if 'current_state' in event_payload:
+        merge_current_state(before, event_payload['current_state'])
+
+    updated_tasks = list(before['tasks'])
     events = list(simulation_run.events.values('event_type', 'uav_id', 'task_point_id', 'state_after'))
     if event_payload:
         events.append(event_payload)
         if event_payload.get('event_type') == 'task_added' and event_payload.get('task'):
-            before['tasks'].append(dict(event_payload['task']))
-    pending = [item for item in before['tasks'] if item.get('status') not in {'completed', 'cancelled'}]
-    cfg = dict(config or {})
+            task = event_payload['task']
+            if not isinstance(task, dict):
+                raise ValueError('新增任务必须是对象。')
+            task_id = _snapshot_id(task.get('id', task.get('task_id')), 'task.id')
+            if not any(str(item.get('id', item.get('task_id'))) == task_id for item in updated_tasks):
+                updated_tasks.append(dict(task))
+    pending = [item for item in updated_tasks if item.get('status') not in {'completed', 'cancelled'}]
+    stored_config = summary_before.get('config') or (summary_before.get('planner') or {}).get('config') or {}
+    cfg = dict(stored_config)
+    cfg.update(config or {})
     cfg.setdefault('algorithm', 'risk_aware_pso')
     cfg.setdefault('random_seed', simulation_run.random_seed)
-    summary_before = simulation_run.summary_metrics or {}
     try:
         scale = float(summary_before.get('coordinate_scale', 1.0) or 1.0)
     except (TypeError, ValueError):
@@ -198,7 +275,7 @@ def replan_simulation(simulation_run: SimulationRun, event_payload=None, config=
     if scale <= 0:
         scale = 1.0
     planner_state = dict(before)
-    planner_state['tasks'] = _scale_tasks(before['tasks'], scale)
+    planner_state['tasks'] = _scale_tasks(updated_tasks, scale)
     planner_state['uavs'] = _scale_uavs(before['uavs'], scale)
     planner_state['map_state'] = _scale_map_state(before['map_state'], scale)
     planner_state['routes'] = _scale_routes(before['routes'], scale)
@@ -213,12 +290,12 @@ def replan_simulation(simulation_run: SimulationRun, event_payload=None, config=
     updated_uavs = [dict(item) for item in before['uavs']]
     if event_payload.get('uav_id') and event_payload.get('event_type') in {'uav_failure', 'failure', 'low_battery'}:
         for item in updated_uavs:
-            if str(item.get('identifier', item.get('id'))) == str(event_payload['uav_id']):
+            if str(item.get('id', item.get('identifier'))) == str(event_payload['uav_id']):
                 item['status'] = 'failed' if event_payload['event_type'] in {'uav_failure', 'failure'} else 'low_battery'
     simulation_run.uav_configuration = updated_uavs
+    simulation_run.task_snapshot = updated_tasks
     simulation_run.summary_metrics = summary
     simulation_run.status = SimulationRun.Status.RUNNING
-    simulation_run.save(update_fields=['uav_configuration', 'summary_metrics', 'status', 'updated_at'])
+    simulation_run.save(update_fields=['uav_configuration', 'task_snapshot', 'summary_metrics', 'status', 'updated_at'])
     return result, before, summary
-
 

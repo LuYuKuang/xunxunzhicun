@@ -100,6 +100,8 @@ class UAVState:
         item = dict(defaults or {})
         item.update(dict(value or {}))
         home = item.get('home') or {}
+        home_x = home.get('x', item.get('home_x'))
+        home_y = home.get('y', item.get('home_y'))
         return cls(
             id=str(item.get('id', item.get('identifier', ''))),
             x=_float(item.get('x', item.get('position_x'))),
@@ -111,8 +113,8 @@ class UAVState:
             max_range=None if item.get('max_range') in (None, '') else max(0.0, _float(item.get('max_range'))),
             status=str(item.get('status', 'idle')),
             payload_used=max(0.0, _float(item.get('payload_used'))),
-            home_x=_float(home.get('x'), _float(item.get('home_x'), 0.0)),
-            home_y=_float(home.get('y'), _float(item.get('home_y'), 0.0)),
+            home_x=None if home_x is None else _float(home_x),
+            home_y=None if home_y is None else _float(home_y),
         )
 
     @property
@@ -125,7 +127,7 @@ class UAVState:
             'battery_reserve': self.battery_reserve, 'speed': self.speed,
             'payload_capacity': self.payload_capacity, 'max_range': self.max_range,
             'status': self.status, 'payload_used': self.payload_used,
-            'home': {'x': self.home_x or 0.0, 'y': self.home_y or 0.0},
+            'home': {axis: value for axis, value in (('x', self.home_x), ('y', self.home_y)) if value is not None},
         }
 
 
@@ -249,5 +251,4 @@ class PlanResult:
             'status': self.status,
             'config': self.config,
         }
-
 

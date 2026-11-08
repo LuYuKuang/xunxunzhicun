@@ -877,6 +877,18 @@ def simulation_runs(request):
             raise APIInputError('PATCH 请求必须提供 simulation_id。', 'missing_field')
         item = _related(SimulationRun, simulation_id, 'simulation_id')
         payload = _payload(request)
+        if 'current_state' in payload:
+            if 'uav_configuration' in payload or 'task_snapshot' in payload:
+                raise APIInputError('current_state 不能与全量快照同时提交。', 'planner_input_error')
+            from .planner_services import merge_current_state, simulation_snapshot
+
+            state = simulation_snapshot(item)
+            try:
+                merge_current_state(state, payload['current_state'])
+            except ValueError as exc:
+                raise APIInputError(str(exc), 'planner_input_error') from exc
+            item.uav_configuration = state['uavs']
+            item.task_snapshot = state['tasks']
         if 'planning_method' in payload:
             item.planning_method = payload['planning_method']
         if 'random_seed' in payload:
@@ -951,6 +963,7 @@ def simulation_events(request, simulation_id):
 
 @api_errors
 @require_http_methods(['POST'])
+@transaction.atomic
 def simulation_replan(request, simulation_id):
     """根据仿真快照和事件调用 planner，只重新分配未完成任务。"""
     simulation_run = _related(SimulationRun, simulation_id, 'simulation_id')
@@ -977,7 +990,7 @@ def simulation_replan(request, simulation_id):
             uav=event_uav,
             task_point=event_task,
             state_before=before,
-            state_after=summary,
+            state_after={**summary, 'uavs': simulation_run.uav_configuration, 'tasks': simulation_run.task_snapshot},
         )
     SimulationEvent.objects.create(
         simulation_run=simulation_run,
@@ -1018,4 +1031,3 @@ def experiment_results(request):
     item.full_clean()
     item.save()
     return _ok(_experiment_result_data(item), status=201)
-

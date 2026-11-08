@@ -40,9 +40,11 @@ def make_result(routes, tasks, uavs, map_state, config, algorithm, violations=No
                  'priority': task.priority, 'confidence': task.confidence}
                 for task in sequence
             ],
-            'return': ({'x': result['points'][-1][0], 'y': result['points'][-1][1]} if result['points'] else None),
+            'return': ({'x': result['points'][-1][0], 'y': result['points'][-1][1]} if config.return_to_home else None),
             'distance': round(result['distance'], 6),
             'time': round(result['time'], 6),
+            'energy': round(result['energy'], 6),
+            'battery_reserve': uav.battery_reserve,
         }
     pending = [task for task in tasks if task.status not in {'completed', 'cancelled'}]
     unassigned = [task for task in pending if task.id not in assigned]
@@ -92,5 +94,4 @@ def make_result(routes, tasks, uavs, map_state, config, algorithm, violations=No
         status=result_status,
         config=config.to_dict(),
     )
-
 

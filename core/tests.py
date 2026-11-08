@@ -338,5 +338,71 @@ class DispatchApiTests(RegionApiTests):
             self.assertGreaterEqual(route['start']['y'], 0)
             self.assertLessEqual(route['start']['y'], 60)
 
-# Create your tests here.
+    def test_replan_and_finish_use_remaining_battery(self):
+        mission = Mission.objects.create(name='电量仿真', input_image_path='missions/input.png')
+        run = SimulationRun.objects.create(
+            mission=mission,
+            planning_method='risk_aware_pso',
+            status=SimulationRun.Status.RUNNING,
+            uav_configuration=[
+                {'identifier': 'UAV-01', 'position_x': 10, 'position_y': 20,
+                 'battery_level': 90, 'battery_reserve': 15, 'speed': 12},
+                {'id': 'UAV-02', 'x': 10, 'y': 20, 'battery_level': 90},
+            ],
+            task_snapshot=[
+                {'id': 'T-1', 'x': 20, 'y': 20, 'status': 'pending'},
+                {'id': 'T-2', 'x': 40, 'y': 20, 'status': 'pending'},
+            ],
+            summary_metrics={
+                'map_state': {'width': 100, 'height': 60, 'home': {'x': 10, 'y': 20}},
+                'coordinate_scale': 0.1,
+                'planner': {'config': {'energy_per_distance': 0.3}},
+            },
+        )
+        response = self.client.post(
+            f'/api/simulation-runs/{run.pk}/replan/',
+            {
+                'event_type': 'uav_failure',
+                'uav_id': 'UAV-02',
+                'current_state': {
+                    'uavs': [
+                        {'id': 'UAV-01', 'x': 20, 'y': 20, 'battery_level': 80},
+                        {'id': 'UAV-02', 'x': 15, 'y': 20, 'battery_level': 76},
+                    ],
+                    'completed_task_ids': ['T-1'],
+                },
+            },
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        plan = response.json()['data']
+        self.assertEqual(plan['assignments'], {'UAV-01': ['T-2']})
+        route = plan['routes']['UAV-01']
+        self.assertEqual(route['start'], {'x': 20, 'y': 20})
+        self.assertEqual(route['return'], {'x': 10, 'y': 20})
+        self.assertAlmostEqual(route['energy'], 1.5)
+        self.assertEqual(route['battery_reserve'], 15)
 
+        finish_url = f'/api/simulation-runs/?simulation_id={run.pk}'
+        finish_state = {
+            'uavs': [{'id': 'UAV-01', 'x': 10, 'y': 20, 'battery_level': 78.5}],
+            'completed_task_ids': ['T-2'],
+        }
+        response = self.client.patch(
+            finish_url, {'status': 'completed', 'current_state': finish_state}, content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'completed')
+        active, failed = run.uav_configuration
+        self.assertEqual((active['battery_level'], active['position_x'], active['speed']), (78.5, 10, 12))
+        self.assertEqual((failed['battery_level'], failed['status']), (76, 'failed'))
+        self.assertEqual([task['status'] for task in run.task_snapshot], ['completed', 'completed'])
+
+        finish_state['uavs'][0]['battery_level'] = 90
+        response = self.client.patch(finish_url, {'current_state': finish_state}, content_type='application/json')
+        self.assertEqual(response.status_code, 400)
+        run.refresh_from_db()
+        self.assertEqual(run.uav_configuration[0]['battery_level'], 78.5)
+
+# Create your tests here.
