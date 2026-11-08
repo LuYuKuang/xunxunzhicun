@@ -902,6 +902,7 @@ async function startSimulation() {
       },
     })
     simulationPlan.value = plan
+    uavs.value.forEach((uav) => { uav.flightStartBattery = uav.battery })
     applyPlanToScene(plan)
     simulationRunId.value = run.id
     simulationStatus.value = `仿真运行中 · #${run.id}`
@@ -1261,7 +1262,22 @@ onMounted(() => {
       <div class="panel-heading"><div><span class="panel-kicker">ROUTE DETAIL</span><h2>{{ selectedUav.id }}</h2></div><span class="status-chip">{{ selectedUav.status }}</span></div>
       <dl class="selection-dl"><div><dt>分配任务</dt><dd>{{ selectedUav.assigned }}</dd></div><div><dt>当前航程</dt><dd>{{ routeLength(selectedUav.route).toFixed(1) }} px</dd></div><div><dt>当前位置</dt><dd>{{ Math.round(selectedUav.x) }}, {{ Math.round(selectedUav.y) }}</dd></div></dl>
     </div>
-  </article><article class="panel uav-panel"><div class="panel-heading"><div><span class="panel-kicker">FLEET STATUS</span><h2>机队状态</h2></div><span class="count-label">{{ uavs.length }} AIRCRAFT</span></div><div class="uav-list"><div v-for="uav in uavs" :key="uav.id" class="uav-card" :class="{ failed: uav.status === '故障退出' }"><div class="uav-card-top"><span class="uav-color" :style="{ background: uav.color }"></span><div><strong>{{ uav.id }}</strong><small>{{ uav.name }}</small></div><span class="uav-state">{{ uav.status }}</span></div><div class="battery-row"><span>电量</span><div class="battery-track"><i :style="{ width: `${uav.battery}%`, background: uav.color }"></i></div><b>{{ uav.battery.toFixed(1) }}%</b></div><div class="uav-meta"><span>分配任务 <b>{{ uav.assigned }}</b></span><span>电量预留 <b>{{ uav.batteryReserve == null ? '—' : `${uav.batteryReserve}%` }}</b></span></div></div></div></article><article class="panel event-panel simulation-events"><div class="panel-heading"><div><span class="panel-kicker">EVENT INJECTION</span><h2>事件模拟</h2></div><span class="event-help">用于演示</span></div><div class="event-buttons"><button :disabled="simulationRequestPending || !canInjectFailure" @click="triggerEvent('故障')"><span class="event-button-icon danger">×</span><div><strong>UAV-02 故障</strong><small>模拟退出并重规划</small></div><span>→</span></button><button :disabled="simulationRequestPending || !mapReady" @click="triggerEvent('新增')"><span class="event-button-icon add">＋</span><div><strong>新增复查任务</strong><small>生成增量航线</small></div><span>→</span></button></div></article></aside>
+  </article>
+  <article class="panel uav-panel">
+    <div class="panel-heading"><div><span class="panel-kicker">FLEET STATUS</span><h2>机队状态</h2></div><span class="count-label">{{ uavs.length }} AIRCRAFT</span></div>
+    <div class="uav-list">
+      <div v-for="uav in uavs" :key="uav.id" class="uav-card" :class="{ failed: uav.status === '故障退出' }">
+        <div class="uav-card-top"><span class="uav-color" :style="{ background: uav.color }"></span><div><strong>{{ uav.id }}</strong><small>{{ uav.name }}</small></div><span class="uav-state">{{ uav.status }}</span></div>
+        <div class="battery-row">
+          <span>剩余电量</span><b>{{ uav.battery.toFixed(1) }}%</b>
+          <div class="battery-track" role="meter" :aria-label="`${uav.id} 剩余电量`" aria-valuemin="0" aria-valuemax="100" :aria-valuenow="uav.battery.toFixed(1)"><i :style="{ width: `${uav.battery}%`, background: uav.color }"></i></div>
+        </div>
+        <div class="battery-usage"><span>本轮已耗</span><b>{{ uav.flightStartBattery == null ? '—' : `${Math.max(0, uav.flightStartBattery - uav.battery).toFixed(1)} 个百分点` }}</b></div>
+        <div class="uav-meta"><span>分配任务 <b>{{ uav.assigned }}</b></span><span>电量预留 <b>{{ uav.batteryReserve == null ? '—' : `${uav.batteryReserve}%` }}</b></span></div>
+      </div>
+    </div>
+  </article>
+  <article class="panel event-panel simulation-events"><div class="panel-heading"><div><span class="panel-kicker">EVENT INJECTION</span><h2>事件模拟</h2></div><span class="event-help">用于演示</span></div><div class="event-buttons"><button :disabled="simulationRequestPending || !canInjectFailure" @click="triggerEvent('故障')"><span class="event-button-icon danger">×</span><div><strong>UAV-02 故障</strong><small>模拟退出并重规划</small></div><span>→</span></button><button :disabled="simulationRequestPending || !mapReady" @click="triggerEvent('新增')"><span class="event-button-icon add">＋</span><div><strong>新增复查任务</strong><small>生成增量航线</small></div><span>→</span></button></div></article></aside>
           </div>
           <div class="simulation-metrics"><article class="metric-card"><span>仿真进度</span><strong>{{ progressLabel }}</strong><div class="metric-progress"><i :style="{ width: `${simulationProgress}%` }"></i></div></article><article class="metric-card"><span>重点任务完成率</span><strong>{{ plannerCompletionLabel }}</strong><em>{{ simulationPlan ? '当前计划' : '等待计划' }}</em></article><article class="metric-card"><span>已规划总航程</span><strong>{{ plannerDistanceLabel }}</strong><em>{{ simulationPlan ? '二维仿真距离' : '等待计划' }}</em></article><article class="metric-card"><span>预计完成时间</span><strong>{{ plannerTimeLabel }}</strong><em>{{ simulationPlan ? '当前计划 makespan' : '等待计划' }}</em></article></div>
         </section>
