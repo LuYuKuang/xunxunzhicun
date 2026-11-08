@@ -39,6 +39,7 @@ const isProcessing = ref(false)
 const showMask = ref(true)
 const fileInput = ref(null)
 const isRunning = ref(false)
+const simulationRequestPending = ref(false)
 const simulationProgress = ref(0)
 const simulationStatus = ref('等待真实任务')
 const simulationTimer = ref(null)
@@ -48,7 +49,6 @@ const manualTaskLoading = ref(false)
 const simulationRunId = ref(null)
 const simulationPlan = ref(null)
 const simulationError = ref('')
-const failedUav = ref('')
 const dataMenuOpen = ref(true)
 const activeDataGroup = ref('data-assets')
 const tableRows = ref([])
@@ -244,6 +244,8 @@ const defaultUavs = [
   { id: 'UAV-03', name: '侦察三号', color: '#9b9cf8', battery: 91, status: '待命', assigned: 0, x: 0, y: 0, route: [] },
 ]
 const uavs = ref(cloneUavs(defaultUavs))
+const canInjectFailure = computed(() => simulationRunId.value
+  && uavs.value.some((uav) => uav.id === 'UAV-02' && uav.status !== '故障退出'))
 
 const recognitionClasses = ref([])
 
@@ -443,6 +445,10 @@ function openFilePicker() {
 
 function setFile(file) {
   if (!file) return
+  if (isRunning.value || simulationRequestPending.value) {
+    recognitionError.value = '请先完成或重置当前仿真，再更换图片。'
+    return
+  }
   if (!file.type.startsWith('image/')) {
     recognitionError.value = '请选择 JPG、PNG 或 WEBP 图片。'
     return
@@ -462,7 +468,7 @@ function setFile(file) {
   missionRegions.value = []
   dispatchNote.value = ''
   tasks.value = []
-  simulationPlan.value = null
+  resetSimulation()
   recognitionError.value = ''
   if (imagePreview.value) URL.revokeObjectURL(imagePreview.value)
   imagePreview.value = URL.createObjectURL(file)
@@ -484,6 +490,10 @@ function loadSample() {
 
 async function runRecognition() {
   if (isProcessing.value) return
+  if (isRunning.value || simulationRequestPending.value) {
+    recognitionError.value = '请先完成或重置当前仿真，再重新识别。'
+    return
+  }
   if (!selectedFile.value) {
     loadSample()
     return
@@ -495,6 +505,7 @@ async function runRecognition() {
     const uploaded = await uploadImage(selectedFile.value)
     uploadStage.value = '图片已保存，正在请求模型识别…'
     const result = await recognizeImage(selectedFile.value, '', uploaded.mission_id)
+    resetSimulation()
     recognitionResult.value = result
     imageWidth.value = Number(result.width || 0)
     imageHeight.value = Number(result.height || 0)
@@ -648,12 +659,25 @@ function simulationUavSnapshot() {
     identifier: uav.id,
     name: uav.name,
     battery_level: uav.battery,
-    status: uav.status,
+    status: {
+      待命: 'idle',
+      执行中: 'in_flight',
+      已完成: 'completed',
+      故障退出: 'failed',
+      低电量: 'low_battery',
+    }[uav.status],
     position_x: uav.x,
     position_y: uav.y,
     assigned: uav.assigned,
     route: uav.route,
   }))
+}
+
+function currentFlightState() {
+  return {
+    uavs: uavs.value.map(({ id, x, y, battery }) => ({ id, x, y, battery_level: battery })),
+    completed_task_ids: tasks.value.filter((task) => task.status === '已完成').map((task) => String(task.id)),
+  }
 }
 
 function routeLength(route) {
@@ -702,11 +726,17 @@ function applyPlanToScene(plan, { keepPrevious = false } = {}) {
   const assignments = plan.assignments || {}
   tasks.value.forEach((task) => {
     const assigned = Object.values(assignments).some((items) => items.includes(task.id))
-    if (assigned && task.status !== '已完成') task.status = '执行中'
+    if (task.status !== '已完成') task.status = assigned ? '执行中' : '待复查'
   })
   uavs.value.forEach((uav) => {
     const route = plan.routes[uav.id]
-    if (!route) return
+    if (!route) {
+      uav.route = []
+      uav.routeTaskIds = []
+      uav.assigned = 0
+      if (uav.status !== '故障退出' && uav.status !== '低电量') uav.status = '待命'
+      return
+    }
     const points = [route.start, ...(route.tasks || []), route.return].filter(Boolean)
     uav.route = points.map((point) => [Number(point.x), Number(point.y)])
     uav.routeTaskIds = (route.tasks || []).map((point) => String(point.task_id))
@@ -715,27 +745,50 @@ function applyPlanToScene(plan, { keepPrevious = false } = {}) {
       uav.y = uav.route[0][1]
     }
     uav.assigned = (route.tasks || []).length
-    if (uav.status !== '故障退出') uav.status = uav.assigned ? '执行中' : '待命'
+    uav.batteryReserve = route.battery_reserve ?? uav.batteryReserve
+    if (uav.status !== '故障退出') uav.status = uav.assigned || routeLength(uav.route) > 0 ? '执行中' : '待命'
   })
 }
 
-function startRouteAnimation() {
+function startRouteAnimation(fromProgress = 0) {
   if (animationFrame.value) cancelAnimationFrame(animationFrame.value)
   const startedAt = performance.now()
-  const duration = Math.max(2500, Math.min(12000, (simulationPlan.value?.metrics?.total_time || 8) * 1000))
+  const plan = simulationPlan.value
+  const duration = Math.max(2500, Math.min(12000, (plan?.metrics?.total_time || 8) * 1000))
+  const flights = uavs.value
+    .filter((uav) => uav.status === '执行中' && uav.route.length)
+    .map((uav) => {
+      const route = plan?.routes?.[uav.id]
+      // Older plans already report distance in planner units, even when waypoints are in pixels.
+      const energy = Number(route?.energy ?? (route?.distance * plan?.config?.energy_per_distance))
+      return {
+        uav,
+        distance: routeLength(uav.route),
+        startBattery: uav.battery,
+        energy: Number.isFinite(energy) && energy > 0 ? energy : 0,
+      }
+    })
   const frame = (now) => {
-    const progress = Math.min(1, (now - startedAt) / duration)
+    const progress = Math.min(1, fromProgress + (now - startedAt) / duration)
     simulationProgress.value = progress * 100
-    uavs.value.forEach((uav) => {
-      const routeDistance = routeLength(uav.route)
-      const point = pointAtDistance(uav.route, routeDistance * progress)
-      uav.x = point[0]
-      uav.y = point[1]
-      ;(uav.routeTaskIds || []).forEach((taskId, index) => {
+    flights.forEach(({ uav, distance, startBattery, energy }) => {
+      if (uav.status !== '执行中') return
+      const maxProgress = energy ? fromProgress + startBattery / energy : 1
+      const flownProgress = Math.min(progress, maxProgress)
+      const travelled = distance * flownProgress
+      const [x, y] = pointAtDistance(uav.route, travelled)
+      uav.x = x
+      uav.y = y
+      uav.battery = Math.max(0, startBattery - energy * (flownProgress - fromProgress))
+      uav.routeTaskIds.forEach((taskId, index) => {
         const task = tasks.value.find((item) => String(item.id) === String(taskId))
         if (!task || task.status === '已完成') return
-        if (progress * routeDistance >= distanceToRoutePoint(uav.route, index + 1)) task.status = '已完成'
+        if (travelled >= distanceToRoutePoint(uav.route, index + 1)) task.status = '已完成'
       })
+      if (maxProgress < 1 && progress >= maxProgress) {
+        uav.battery = 0
+        uav.status = '低电量'
+      }
     })
     if (progress < 1) {
       animationFrame.value = requestAnimationFrame(frame)
@@ -754,14 +807,17 @@ async function finishSimulation() {
   simulationStatus.value = '仿真已完成'
   if (animationFrame.value) cancelAnimationFrame(animationFrame.value)
   animationFrame.value = null
-  tasks.value.forEach((task) => { task.status = '已完成' })
-  uavs.value.forEach((uav) => { if (uav.status !== '故障退出') uav.status = '已完成' })
+  tasks.value.forEach((task) => { if (task.status === '执行中') task.status = '待复查' })
+  uavs.value.forEach((uav) => { if (uav.status === '执行中') uav.status = '已完成' })
   eventLog.value.unshift({ time: '刚刚', title: '仿真运行完成', detail: `${selectedAlgorithm.value} · ${tasks.value.length} 个任务点`, tone: 'success' })
   if (!runId) return
+  simulationRequestPending.value = true
   try {
     const run = await updateSimulationRun(runId, {
       status: 'completed',
+      current_state: currentFlightState(),
       summary_metrics: {
+        ...(simulationPlan.value?.metrics || {}),
         completion_rate: tasks.value.length ? completedCount.value / tasks.value.length : 0,
         planned_distance_km: Number(((simulationPlan.value?.metrics?.total_distance || 0) / 100).toFixed(3)),
         task_count: tasks.value.length,
@@ -773,7 +829,6 @@ async function finishSimulation() {
         },
         coordinate_scale: 0.1,
         routes: simulationPlan.value?.routes || {},
-        ...(simulationPlan.value?.metrics || {}),
         planner: simulationPlan.value || {},
       },
     })
@@ -782,11 +837,13 @@ async function finishSimulation() {
     }
   } catch (error) {
     simulationError.value = error.message || '仿真已完成，但结果回写失败。'
+  } finally {
+    simulationRequestPending.value = false
   }
 }
 
 async function startSimulation() {
-  if (isRunning.value) return
+  if (isRunning.value || simulationRequestPending.value || isProcessing.value) return
   const missionId = missionDetail.value?.id || selectedMissionId.value
   if (!missionId || !mapReady.value) {
     simulationError.value = '请先完成一次图像识别，再进入调度仿真。'
@@ -798,7 +855,12 @@ async function startSimulation() {
     simulationStatus.value = '没有可调度任务'
     return
   }
+  if (tasks.value.every((task) => task.status === '已完成')) {
+    simulationError.value = '当前任务已完成，重置场景后可以重新仿真。'
+    return
+  }
   simulationError.value = ''
+  simulationRequestPending.value = true
   isRunning.value = true
   simulationStatus.value = '仿真运行中'
   simulationProgress.value = 0
@@ -819,8 +881,6 @@ async function startSimulation() {
       },
       config: { population_size: 16, iterations: 24, energy_per_distance: 0.08 },
     })
-    simulationPlan.value = plan
-    applyPlanToScene(plan, { keepPrevious: false })
     const run = await createSimulationRun({
       mission_id: missionId,
       planning_method: planningMethod,
@@ -841,86 +901,101 @@ async function startSimulation() {
         routes: plan.routes || {},
       },
     })
+    simulationPlan.value = plan
+    applyPlanToScene(plan)
     simulationRunId.value = run.id
     simulationStatus.value = `仿真运行中 · #${run.id}`
     eventLog.value.unshift({ time: '刚刚', title: '仿真运行已创建', detail: `${selectedAlgorithm.value} · Mission #${missionId}`, tone: 'teal' })
     startRouteAnimation()
   } catch (error) {
     isRunning.value = false
-    simulationRunId.value = null
     simulationStatus.value = '仿真启动失败'
     simulationError.value = error.message || '无法创建仿真运行记录。'
+  } finally {
+    simulationRequestPending.value = false
   }
 }
 
 async function triggerEvent(type) {
+  if (simulationRequestPending.value || isProcessing.value || !mapReady.value) return
+  const failure = type === '故障'
+  if (failure && !canInjectFailure.value) return
   simulationError.value = ''
   const runId = simulationRunId.value
-  if (type === '故障') {
-    failedUav.value = 'UAV-02'
-    const target = uavs.value.find((uav) => uav.id === 'UAV-02')
-    if (target) {
-      target.status = '故障退出'
-      target.battery = 14
-    }
-    simulationStatus.value = '已触发动态重规划'
-    simulationProgress.value = Math.max(simulationProgress.value, 48)
-    eventLog.value.unshift({ time: '刚刚', title: 'UAV-02 故障退出', detail: '剩余任务已重新分配给 UAV-01 / UAV-03', tone: 'danger' })
-    if (runId) {
-      try {
-        if (animationFrame.value) cancelAnimationFrame(animationFrame.value)
-        const plan = await replanSimulation(runId, {
-          event_type: 'uav_failure',
-          uav_id: 'UAV-02',
-          config: { algorithm: 'risk_aware_pso', random_seed: 42, population_size: 16, iterations: 20 },
-        })
-        simulationPlan.value = plan
-        applyPlanToScene(plan, { keepPrevious: true })
-        startRouteAnimation()
-      } catch (error) {
-        simulationError.value = error.message || '故障事件回写失败。'
-      }
-    }
-  } else {
-    const newTask = {
-      id: `T-${String(tasks.value.length + 1).padStart(3, '0')}`,
-      label: '新增临时复查点',
-      type: '受淹区域',
-      level: '高',
-      score: 0.82,
-      status: '待复查',
-      x: imageWidth.value * 0.58,
-      y: imageHeight.value * 0.42,
-      category: 'flooded_area',
-      priority: 12,
-      areaPx: 0,
-      areaRatio: 0,
-      source: 'event',
-    }
+  const newTask = failure ? null : {
+    id: `T-${String(tasks.value.length + 1).padStart(3, '0')}`,
+    label: '新增临时复查点',
+    type: '受淹区域',
+    level: '高',
+    score: 0.82,
+    status: '待复查',
+    x: imageWidth.value * 0.58,
+    y: imageHeight.value * 0.42,
+    category: 'flooded_area',
+    priority: 12,
+    areaPx: 0,
+    areaRatio: 0,
+    source: 'event',
+  }
+  if (!runId) {
     tasks.value.push(newTask)
     simulationStatus.value = '新增任务等待分配'
-    eventLog.value.unshift({ time: '刚刚', title: '新增 1 个复查任务', detail: '调度器正在计算最短增量航线', tone: 'orange' })
-    if (runId) {
-      try {
-        if (animationFrame.value) cancelAnimationFrame(animationFrame.value)
-        const plan = await replanSimulation(runId, {
+    eventLog.value.unshift({ time: '刚刚', title: '新增 1 个复查任务', detail: '等待开始仿真', tone: 'orange' })
+    return
+  }
+
+  const previousStatus = simulationStatus.value
+  const previousProgress = simulationProgress.value / 100
+  const wasPlaying = animationFrame.value !== null
+  if (wasPlaying) cancelAnimationFrame(animationFrame.value)
+  animationFrame.value = null
+  simulationRequestPending.value = true
+  simulationStatus.value = '正在重新规划航线'
+  try {
+    const event = failure
+      ? { event_type: 'uav_failure', uav_id: 'UAV-02' }
+      : {
           event_type: 'task_added',
-          task: { id: newTask.id, x: newTask.x, y: newTask.y, category: 'flooded_area', area: 0, confidence: newTask.score, priority: 12, status: 'pending' },
-          config: { algorithm: 'risk_aware_pso', random_seed: 42, population_size: 16, iterations: 20 },
-        })
-        simulationPlan.value = plan
-        applyPlanToScene(plan, { keepPrevious: true })
-        startRouteAnimation()
-      } catch (error) {
-        simulationError.value = error.message || '新增任务事件回写失败。'
-      }
-    }
+          task: {
+            id: newTask.id, x: newTask.x, y: newTask.y, category: newTask.category,
+            area: 0, confidence: newTask.score, priority: newTask.priority, status: 'pending',
+          },
+        }
+    const plan = await replanSimulation(runId, {
+      ...event,
+      current_state: currentFlightState(),
+      config: { algorithm: 'risk_aware_pso', random_seed: 42, population_size: 16, iterations: 20 },
+    })
+    if (failure) uavs.value.find((uav) => uav.id === 'UAV-02').status = '故障退出'
+    else tasks.value.push(newTask)
+    simulationPlan.value = plan
+    applyPlanToScene(plan, { keepPrevious: true })
+    simulationStatus.value = `按新航线执行 · #${runId}`
+    simulationProgress.value = 0
+    isRunning.value = true
+    eventLog.value.unshift({
+      time: '刚刚',
+      title: failure ? 'UAV-02 故障退出' : '新增 1 个复查任务',
+      detail: '已根据当前位置和剩余电量重新规划',
+      tone: failure ? 'danger' : 'orange',
+    })
+    startRouteAnimation()
+  } catch (error) {
+    simulationError.value = error.message || '动态重规划失败。'
+    simulationStatus.value = previousStatus
+    if (wasPlaying) startRouteAnimation(previousProgress)
+  } finally {
+    simulationRequestPending.value = false
   }
 }
 
 function resetSimulation() {
+  if (simulationRequestPending.value) return
   if (simulationRunId.value && isRunning.value) {
-    updateSimulationRun(simulationRunId.value, { status: 'cancelled' }).catch(() => {})
+    updateSimulationRun(simulationRunId.value, {
+      status: 'cancelled',
+      current_state: currentFlightState(),
+    }).catch(() => {})
   }
   if (animationFrame.value) cancelAnimationFrame(animationFrame.value)
   animationFrame.value = null
@@ -928,10 +1003,11 @@ function resetSimulation() {
   simulationRunId.value = null
   simulationPlan.value = null
   simulationError.value = ''
-  failedUav.value = ''
   simulationProgress.value = 0
   simulationStatus.value = tasks.value.length ? '等待开始仿真' : '等待真实任务'
   previousRoutes.value = {}
+  selectedUav.value = null
+  tasks.value.forEach((task) => { task.status = '待复查' })
   uavs.value = mapReady.value ? uavsForImage(imageWidth.value, imageHeight.value) : cloneUavs(defaultUavs)
   eventLog.value = [{ time: '刚刚', title: '等待真实任务', detail: tasks.value.length ? `${tasks.value.length} 个区域 · ${uavs.value.length} 架虚拟无人机` : '上传并识别航拍图像后开始', tone: 'teal' }]
 }
@@ -1142,7 +1218,7 @@ onMounted(() => {
         </section>
 
         <section v-else-if="activeView === 'simulation'" class="view-stack">
-          <div class="simulation-toolbar"><div class="algorithm-select"><span>当前策略</span><div class="algorithm-options"><button v-for="algorithm in ['平均分配', '最近邻', '标准 PSO', '风险加权 PSO']" :key="algorithm" :class="{ selected: selectedAlgorithm === algorithm }" @click="selectedAlgorithm = algorithm">{{ algorithm }}</button></div></div><div class="simulation-actions"><button class="outline-button" @click="resetSimulation">重置场景</button><button class="solid-button" :class="{ running: isRunning }" @click="startSimulation">{{ isRunning ? '运行中…' : '开始仿真' }} <span>{{ isRunning ? '◌' : '▶' }}</span></button></div></div><p v-if="simulationError" class="form-error simulation-error" role="alert">{{ simulationError }}</p>
+          <div class="simulation-toolbar"><div class="algorithm-select"><span>当前策略</span><div class="algorithm-options"><button v-for="algorithm in ['平均分配', '最近邻', '标准 PSO', '风险加权 PSO']" :key="algorithm" :class="{ selected: selectedAlgorithm === algorithm }" @click="selectedAlgorithm = algorithm">{{ algorithm }}</button></div></div><div class="simulation-actions"><button class="outline-button" :disabled="simulationRequestPending" @click="resetSimulation">重置场景</button><button class="solid-button" :class="{ running: isRunning }" :disabled="isRunning || simulationRequestPending || isProcessing" @click="startSimulation">{{ isRunning ? '运行中…' : '开始仿真' }} <span>{{ isRunning ? '◌' : '▶' }}</span></button></div></div><p v-if="simulationError" class="form-error simulation-error" role="alert">{{ simulationError }}</p>
           <div class="simulation-layout">
             <article class="panel map-panel"><div class="panel-heading"><div><span class="panel-kicker">LIVE MAP / 02D</span><h2>协同航线与任务态势</h2></div><div class="map-status"><i></i>{{ simulationStatus }}</div></div><div class="map-canvas" :style="{ aspectRatio: mapAspectRatio }">
   <template v-if="mapReady">
@@ -1185,7 +1261,7 @@ onMounted(() => {
       <div class="panel-heading"><div><span class="panel-kicker">ROUTE DETAIL</span><h2>{{ selectedUav.id }}</h2></div><span class="status-chip">{{ selectedUav.status }}</span></div>
       <dl class="selection-dl"><div><dt>分配任务</dt><dd>{{ selectedUav.assigned }}</dd></div><div><dt>当前航程</dt><dd>{{ routeLength(selectedUav.route).toFixed(1) }} px</dd></div><div><dt>当前位置</dt><dd>{{ Math.round(selectedUav.x) }}, {{ Math.round(selectedUav.y) }}</dd></div></dl>
     </div>
-  </article><article class="panel uav-panel"><div class="panel-heading"><div><span class="panel-kicker">FLEET STATUS</span><h2>机队状态</h2></div><span class="count-label">{{ uavs.length }} AIRCRAFT</span></div><div class="uav-list"><div v-for="uav in uavs" :key="uav.id" class="uav-card" :class="{ failed: uav.status === '故障退出' }"><div class="uav-card-top"><span class="uav-color" :style="{ background: uav.color }"></span><div><strong>{{ uav.id }}</strong><small>{{ uav.name }}</small></div><span class="uav-state">{{ uav.status }}</span></div><div class="battery-row"><span>电量</span><div class="battery-track"><i :style="{ width: `${uav.battery}%`, background: uav.color }"></i></div><b>{{ uav.battery }}%</b></div><div class="uav-meta"><span>分配任务 <b>{{ uav.assigned }}</b></span><span>返航余量 <b>{{ Math.max(10, uav.battery - 18) }}%</b></span></div></div></div></article><article class="panel event-panel simulation-events"><div class="panel-heading"><div><span class="panel-kicker">EVENT INJECTION</span><h2>事件模拟</h2></div><span class="event-help">用于演示</span></div><div class="event-buttons"><button @click="triggerEvent('故障')"><span class="event-button-icon danger">×</span><div><strong>UAV-02 故障</strong><small>模拟退出并重规划</small></div><span>→</span></button><button @click="triggerEvent('新增')"><span class="event-button-icon add">＋</span><div><strong>新增复查任务</strong><small>生成增量航线</small></div><span>→</span></button></div></article></aside>
+  </article><article class="panel uav-panel"><div class="panel-heading"><div><span class="panel-kicker">FLEET STATUS</span><h2>机队状态</h2></div><span class="count-label">{{ uavs.length }} AIRCRAFT</span></div><div class="uav-list"><div v-for="uav in uavs" :key="uav.id" class="uav-card" :class="{ failed: uav.status === '故障退出' }"><div class="uav-card-top"><span class="uav-color" :style="{ background: uav.color }"></span><div><strong>{{ uav.id }}</strong><small>{{ uav.name }}</small></div><span class="uav-state">{{ uav.status }}</span></div><div class="battery-row"><span>电量</span><div class="battery-track"><i :style="{ width: `${uav.battery}%`, background: uav.color }"></i></div><b>{{ uav.battery.toFixed(1) }}%</b></div><div class="uav-meta"><span>分配任务 <b>{{ uav.assigned }}</b></span><span>电量预留 <b>{{ uav.batteryReserve == null ? '—' : `${uav.batteryReserve}%` }}</b></span></div></div></div></article><article class="panel event-panel simulation-events"><div class="panel-heading"><div><span class="panel-kicker">EVENT INJECTION</span><h2>事件模拟</h2></div><span class="event-help">用于演示</span></div><div class="event-buttons"><button :disabled="simulationRequestPending || !canInjectFailure" @click="triggerEvent('故障')"><span class="event-button-icon danger">×</span><div><strong>UAV-02 故障</strong><small>模拟退出并重规划</small></div><span>→</span></button><button :disabled="simulationRequestPending || !mapReady" @click="triggerEvent('新增')"><span class="event-button-icon add">＋</span><div><strong>新增复查任务</strong><small>生成增量航线</small></div><span>→</span></button></div></article></aside>
           </div>
           <div class="simulation-metrics"><article class="metric-card"><span>仿真进度</span><strong>{{ progressLabel }}</strong><div class="metric-progress"><i :style="{ width: `${simulationProgress}%` }"></i></div></article><article class="metric-card"><span>重点任务完成率</span><strong>{{ plannerCompletionLabel }}</strong><em>{{ simulationPlan ? '当前计划' : '等待计划' }}</em></article><article class="metric-card"><span>已规划总航程</span><strong>{{ plannerDistanceLabel }}</strong><em>{{ simulationPlan ? '二维仿真距离' : '等待计划' }}</em></article><article class="metric-card"><span>预计完成时间</span><strong>{{ plannerTimeLabel }}</strong><em>{{ simulationPlan ? '当前计划 makespan' : '等待计划' }}</em></article></div>
         </section>
@@ -1214,4 +1290,3 @@ onMounted(() => {
     </main>
   </div>
 </template>
-
